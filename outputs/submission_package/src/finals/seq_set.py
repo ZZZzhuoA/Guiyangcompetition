@@ -13,6 +13,8 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import os
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -207,6 +209,8 @@ def _real_seq_from_runs(by_strategy: dict, snap, feat_dict: dict, ctx: DecisionC
 
 
 _SCENE_ERRORS = (TypeError, ValueError, KeyError, IndexError, AttributeError)
+_SEQ_WORKER_OFFICIAL = None
+_SEQ_WORKER_CONFIG: tuple[int, int, int, int] | None = None
 
 
 def _pack_seq_extra(feat_next, x_hist, a_prev, hist_len) -> dict:
@@ -226,6 +230,58 @@ def _unpack_seq_extra(extra: list[dict]) -> tuple[list, list, list, list]:
         hist_a_rows.append(np.asarray(item["a_prev"], dtype=int))
         hist_len_rows.append(int(item["hist_len"]))
     return x_next_rows, hist_x_rows, hist_a_rows, hist_len_rows
+
+
+def _build_catalog_scene(
+    scene_id: int,
+    entries: dict,
+    official,
+    delta: int,
+    max_mid_slices: int,
+    n_ticks: int,
+    remain: int,
+) -> tuple[int, list[dict], list[dict], list[dict], list[dict]]:
+    """加载并构造一个场景；进程 worker 与单进程路径共用。"""
+    by_strategy, scene_load_errors = load_catalog_scene(entries, official)
+    try:
+        if not by_strategy:
+            raise ValueError("no readable run in scene")
+        scene_rows, scene_dropped, scene_extra = _process_scene(
+            scene_id, by_strategy, delta, max_mid_slices, n_ticks, remain
+        )
+    except _SCENE_ERRORS as exc:
+        scene_rows = []
+        scene_extra = []
+        scene_dropped = [
+            {"scene_id": scene_id, "time": None, "kind": "scene", "reason": f"skip:{exc}"}
+        ]
+    for item in scene_load_errors:
+        scene_dropped.append(
+            {"scene_id": scene_id, "time": None, "kind": "load", "reason": f"skip:{item['error']}"}
+        )
+    return scene_id, scene_rows, scene_dropped, scene_extra, scene_load_errors
+
+
+def _init_seq_worker(official, delta: int, max_mid_slices: int, n_ticks: int, remain: int) -> None:
+    global _SEQ_WORKER_OFFICIAL, _SEQ_WORKER_CONFIG
+    _SEQ_WORKER_OFFICIAL = official
+    _SEQ_WORKER_CONFIG = (int(delta), int(max_mid_slices), int(n_ticks), int(remain))
+
+
+def _seq_worker_task(scene: tuple[int, dict]):
+    if _SEQ_WORKER_OFFICIAL is None or _SEQ_WORKER_CONFIG is None:
+        raise RuntimeError("sequential worker was not initialized")
+    scene_id, entries = scene
+    delta, max_mid_slices, n_ticks, remain = _SEQ_WORKER_CONFIG
+    return _build_catalog_scene(
+        scene_id,
+        entries,
+        _SEQ_WORKER_OFFICIAL,
+        delta,
+        max_mid_slices,
+        n_ticks,
+        remain,
+    )
 
 
 def _process_scene(
@@ -306,6 +362,7 @@ def build_seq_set(
     n_ticks: int = 120,
     results_csv: Path | None = None,
     resume: bool = True,
+    workers: int | None = None,
 ) -> dict:
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
@@ -339,32 +396,71 @@ def build_seq_set(
         raise ValueError("seq checkpoint missing x_next/x_hist; rerun with --fresh")
     if done:
         print(f"resume seq: skip {len(done)} finished scene(s)", flush=True)
+    # 启动时只需要 done 做跳过判断；旧结果在全部场景完成后从按 scene 排序的
+    # 检查点统一装载。这里先释放历史 payload，给并行 worker 留出内存。
+    rows, dropped, extra = [], [], []
     scenes = [(scene_id, entries) for scene_id, entries in sorted(catalog.items()) if scene_id not in done]
+    worker_count = min(4, os.cpu_count() or 1) if workers is None else int(workers)
+    if worker_count < 1:
+        raise ValueError(f"workers must be >= 1, got {worker_count}")
+    worker_count = min(worker_count, max(1, len(scenes)))
+    print(f"seq workers: {worker_count}; pending scenes: {len(scenes)}", flush=True)
     bar = ProgressBar(len(scenes), prefix="seq")
-    for scene_id, entries in scenes:
-        by_strategy, scene_load_errors = load_catalog_scene(entries, official)
+
+    def accept(result) -> None:
+        scene_id, scene_rows, scene_dropped, scene_extra, scene_load_errors = result
         if scene_load_errors:
             ingest["n_load_errors"] = int(ingest.get("n_load_errors", 0)) + len(scene_load_errors)
             ingest.setdefault("load_errors", []).extend(scene_load_errors)
-        try:
-            if not by_strategy:
-                raise ValueError("no readable run in scene")
-            scene_rows, scene_dropped, scene_extra = _process_scene(
-                scene_id, by_strategy, delta, max_mid_slices, n_ticks, remain
-            )
-        except _SCENE_ERRORS as exc:
-            scene_rows, scene_dropped, scene_extra = [], [{"scene_id": scene_id, "time": None, "kind": "scene", "reason": f"skip:{exc}"}], []
-        for item in scene_load_errors:
-            scene_dropped.append(
-                {"scene_id": scene_id, "time": None, "kind": "load", "reason": f"skip:{item['error']}"}
-            )
-        rows.extend(scene_rows)
-        dropped.extend(scene_dropped)
-        extra.extend(scene_extra)
         ckpt.save_scene(scene_id, scene_rows, scene_dropped, scene_extra)
         bar.update(extra=f"scene {scene_id}")
-        del by_strategy
+
+    if worker_count == 1:
+        for scene_id, entries in scenes:
+            accept(
+                _build_catalog_scene(
+                    scene_id, entries, official, delta, max_mid_slices, n_ticks, remain
+                )
+            )
+    elif scenes:
+        # 只维持 2×workers 个在途场景。每个 worker 同时只持有一个场景的三张
+        # 大表，既获得 CPU 并行，也避免一次提交全部场景后结果堆在主进程内存中。
+        pool = ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_init_seq_worker,
+            initargs=(official, delta, max_mid_slices, n_ticks, remain),
+        )
+        pending = {}
+        scene_iter = iter(scenes)
+
+        def submit_one() -> bool:
+            try:
+                scene = next(scene_iter)
+            except StopIteration:
+                return False
+            future = pool.submit(_seq_worker_task, scene)
+            pending[future] = int(scene[0])
+            return True
+
+        for _ in range(min(len(scenes), worker_count * 2)):
+            submit_one()
+        try:
+            while pending:
+                completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    pending.pop(future)
+                    accept(future.result())
+                    submit_one()
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
     bar.close()
+    # 并行完成顺序不固定。按场景文件重新装载，保证输出行序和模型训练可复现。
+    _, rows, dropped, extra = ckpt.load()
     if not rows:
         raise ValueError("No sequential samples kept")
     x_next_rows, hist_x_rows, hist_a_rows, hist_len_rows = _unpack_seq_extra(extra)
@@ -413,6 +509,7 @@ def build_seq_set(
         "gamma": GAMMA,
         "mix_lambda": MIX_LAMBDA,
         "window": WINDOW,
+        "workers": worker_count,
         "n_rows": len(rows),
         "n_scenes": len(catalog),
         "n_runs": ingest.get("n_runs", sum(len(entries) for by_strategy in catalog.values() for entries in by_strategy.values())),

@@ -4,6 +4,7 @@
 
   python scripts/run_on_site.py --input kemu6_data_72mb
   python scripts/run_on_site.py --input D:\\path\\to\\kemu6_data_72mb --delta 20
+  python scripts/run_on_site.py --input kemu6_data_72mb --reuse-built --workers 4
 """
 
 from __future__ import annotations
@@ -40,6 +41,15 @@ def _blocked(compare_path: Path, dataset_dir: Path) -> list[str]:
     return collect_blockers(summary, dataset_dir)
 
 
+def _completed_dataset(dataset_dir: Path) -> dict | None:
+    """显式复用完整数据集；存在 _ckpt 时说明仍需续建，不能误用旧成品。"""
+    summary_path = Path(dataset_dir) / "summary.json"
+    samples_path = Path(dataset_dir) / "training_samples.npz"
+    if (Path(dataset_dir) / "_ckpt").exists() or not summary_path.exists() or not samples_path.exists():
+        return None
+    return json.loads(summary_path.read_text(encoding="utf-8"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="On-site: build datasets, train all models, compare, export policy.pkl.")
     parser.add_argument("--input", type=Path, required=True, help="样本根目录，例如 kemu6_data_72mb")
@@ -51,6 +61,8 @@ def main() -> None:
     parser.add_argument("--results", type=Path, default=None, help="官方拦截率 CSV；默认在 --input 及其上一级自动找")
     parser.add_argument("--fresh", action="store_true", help="忽略建集 _ckpt，从头建 slice/seq")
     parser.add_argument("--time-stride", type=float, default=2.0, help="slice 候选点时间步长（秒）")
+    parser.add_argument("--seq-workers", "--workers", dest="seq_workers", type=int, default=4, help="贯序建集并行进程数")
+    parser.add_argument("--reuse-built", action="store_true", help="复用已完整生成的 slice/seq；有 _ckpt 的部分仍断点续建")
     args = parser.parse_args()
 
     sample_root = args.input
@@ -67,27 +79,36 @@ def main() -> None:
     print(f"      found {n_runs} CSV run folder(s)")
 
     print("[2/6] build slice set")
-    slice_summary = build_slice_set(
-        sample_root,
-        slice_dir,
-        n_ticks=args.n_ticks,
-        results_csv=args.results,
-        resume=not args.fresh,
-        time_stride_s=args.time_stride,
-    )
+    slice_summary = _completed_dataset(slice_dir) if args.reuse_built and not args.fresh else None
+    if slice_summary is None:
+        slice_summary = build_slice_set(
+            sample_root,
+            slice_dir,
+            n_ticks=args.n_ticks,
+            results_csv=args.results,
+            resume=not args.fresh,
+            time_stride_s=args.time_stride,
+        )
+    else:
+        print(f"      reuse completed dataset: {slice_dir / 'training_samples.npz'}")
     _print("slice set", {k: slice_summary[k] for k in ("n_rows", "n_scenes", "n_runs", "n_scenes_with_3_replicates", "n_scenes_with_3_strategies", "n_official_matched", "kind_counts") if k in slice_summary})
 
     seq_summary = None
     if not args.skip_seq:
         print("[3/6] build seq set")
-        seq_summary = build_seq_set(
-            sample_root,
-            seq_dir,
-            delta=args.delta,
-            n_ticks=args.n_ticks,
-            results_csv=args.results,
-            resume=not args.fresh,
-        )
+        seq_summary = _completed_dataset(seq_dir) if args.reuse_built and not args.fresh else None
+        if seq_summary is None:
+            seq_summary = build_seq_set(
+                sample_root,
+                seq_dir,
+                delta=args.delta,
+                n_ticks=args.n_ticks,
+                results_csv=args.results,
+                resume=not args.fresh,
+                workers=args.seq_workers,
+            )
+        else:
+            print(f"      reuse completed dataset: {seq_dir / 'training_samples.npz'}")
         _print("seq set", {k: seq_summary[k] for k in ("n_rows", "n_scenes", "n_runs", "n_scenes_with_3_replicates", "n_scenes_with_3_strategies", "n_official_matched", "label_means") if k in seq_summary})
     else:
         print("[3/6] skip seq set")
