@@ -1,0 +1,66 @@
+{
+  "targets": [
+    {
+      "TargetUnitID": 101,
+      "TargetUnitType": "BlueTarget",
+      "B_l_jbz": false,
+      "Ui_Zwx": 1,
+      "D_X": 9000.0,
+      "D_Y": 1200.0,
+      "D_Z": 400.0,
+      "D_XV": -220.0,
+      "D_YV": -30.0,
+      "D_ZV": -5.0,
+      "Klj_list": [
+        {
+          "UI_FSChandle": 11,
+          "Str_HLMC": "Type1",
+          "B_DDKsslj": true,
+          "B_GPKsslj": false,
+          "B_HPMKsslj": false,
+          "B_GNJGKsslj": false,
+          "D_LJGL": 0.72
+        }
+      ]
+    },
+    {
+      "TargetUnitID": 102,
+      "TargetUnitType": "BlueTarget",
+      "B_l_jbz": false,
+      "Ui_Zwx": 3,
+      "D_X": 14000.0,
+      "D_Y": -2600.0,
+      "D_Z": 1500.0,
+      "D_XV": -180.0,
+      "D_YV": 40.0,
+      "D_ZV": -12.0,
+      "Klj_list": [
+        {
+          "UI_FSChandle": 12,
+          "Str_HLMC": "Type2",
+          "B_DDKsslj": false,
+          "B_GPKsslj": true,
+          "B_HPMKsslj": false,
+          "B_GNJGKsslj": false,
+          "D_LJGL": 0.55
+        }
+      ]
+    }
+  ],
+  "units": [
+    {
+      "UnitID": 11,
+      "UnitType": "Type1",
+      "UnitPos_x": 0.0,
+      "UnitPos_y": 0.0,
+      "UnitPos_z": 0.0
+    },
+    {
+      "UnitID": 12,
+      "UnitType": "Type2",
+      "UnitPos_x": 500.0,
+      "UnitPos_y": 200.0,
+      "UnitPos_z": 0.0
+    }
+  ]
+}

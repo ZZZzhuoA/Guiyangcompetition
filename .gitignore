@@ -1,0 +1,49 @@
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.cursor/
+Thumbs.db
+Desktop.ini
+*.swp
+
+# Archives and local dumps
+*.zip
+*.7z
+*.rar
+
+# Organizer / local sample data (too large; regenerate or keep offline)
+Data/
+kemu6_data_72mb/
+决赛/
+*.doc
+outputs/_finals_smoke/
+outputs/_finals_scale_smoke/
+outputs/csv_format_fixtures/
+outputs/data_analysis/
+outputs/final_submission_clean/
+outputs/finals_synth/
+outputs/finals_slice/
+outputs/finals_seq/
+outputs/finals_seq_*/
+outputs/finals_dataset/
+outputs/stage*/
+outputs/finals_model_*/
+outputs/finals_model/*.pkl
+!outputs/finals_model/policy.pkl
+!outputs/submission_package/

@@ -1,0 +1,49 @@
+{
+  "model_path": "outputs\\finals_model\\policy.pkl",
+  "model_name": "rf_pair",
+  "mode": "single_slice_scoring",
+  "n_features": 64,
+  "n_train": 36,
+  "n_test": 12,
+  "train_groups": {
+    "n_groups": 12,
+    "match": 0.75,
+    "pred_hist": {
+      "1": 8,
+      "2": 4,
+      "3": 0
+    },
+    "oracle_hist": {
+      "1": 11,
+      "2": 1,
+      "3": 0
+    },
+    "collapse": 0.6666666666666666,
+    "mean_score_margin": 0.1717718779579442,
+    "random_baseline": 0.3333333333333333,
+    "oracle_key": "utility"
+  },
+  "test_groups": {
+    "n_groups": 4,
+    "match": 0.0,
+    "pred_hist": {
+      "1": 0,
+      "2": 4,
+      "3": 0
+    },
+    "oracle_hist": {
+      "1": 4,
+      "2": 0,
+      "3": 0
+    },
+    "collapse": 1.0,
+    "mean_score_margin": 0.21659711232161888,
+    "random_baseline": 0.3333333333333333,
+    "oracle_key": "utility"
+  },
+  "strategies": [
+    1,
+    2,
+    3
+  ]
+}

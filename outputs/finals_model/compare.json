@@ -1,0 +1,380 @@
+{
+  "mode": "model_compare",
+  "n_features": 64,
+  "default_submit": "rf_pair",
+  "chosen": "constant_1",
+  "note": "chosen 只是当前指标排序，不会覆盖 policy.pkl。没有周期回放前不要用它定提交模型。",
+  "rows": [
+    {
+      "name": "constant_1",
+      "family": "baseline",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 0.9166666666666666,
+      "test_match": 1.0,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 1.0,
+      "test_score_margin": 1.0,
+      "test_pred_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.0032750016544014215,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.3464285714285714,
+      "latency_ok": true,
+      "rank": 1
+    },
+    {
+      "name": "constant_2",
+      "family": "baseline",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 0.08333333333333333,
+      "test_match": 0.0,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 1.0,
+      "test_score_margin": 1.0,
+      "test_pred_hist": {
+        "1": 0,
+        "2": 4,
+        "3": 0
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.0031050003599375486,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.19642857142857142,
+      "latency_ok": true,
+      "rank": 5
+    },
+    {
+      "name": "constant_3",
+      "family": "baseline",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 0.0,
+      "test_match": 0.0,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 1.0,
+      "test_score_margin": 1.0,
+      "test_pred_hist": {
+        "1": 0,
+        "2": 0,
+        "3": 4
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.003155000740662217,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.19642857142857142,
+      "latency_ok": true,
+      "rank": 6
+    },
+    {
+      "name": "rule",
+      "family": "baseline",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 0.9166666666666666,
+      "test_match": 1.0,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 1.0,
+      "test_score_margin": 1.0,
+      "test_pred_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.01000500051304698,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.3464285714285714,
+      "latency_ok": true,
+      "rank": 2
+    },
+    {
+      "name": "rf_utility",
+      "family": "q_tree",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 0.9166666666666666,
+      "test_match": 1.0,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 1.0,
+      "test_score_margin": 0.0,
+      "test_pred_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.2979050041176379,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.3464285714285714,
+      "latency_ok": true,
+      "rank": 3
+    },
+    {
+      "name": "pairwise",
+      "family": "rank",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 0.75,
+      "test_match": 0.0,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 1.0,
+      "test_score_margin": 0.5019070685630915,
+      "test_pred_hist": {
+        "1": 0,
+        "2": 4,
+        "3": 0
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.20629999926313758,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.19642857142857142,
+      "latency_ok": true,
+      "rank": 7
+    },
+    {
+      "name": "rf_pair",
+      "family": "q_blend",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 0.75,
+      "test_match": 0.0,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 1.0,
+      "test_score_margin": 0.21659711232161888,
+      "test_pred_hist": {
+        "1": 0,
+        "2": 4,
+        "3": 0
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.44104999979026616,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.19642857142857142,
+      "latency_ok": true,
+      "rank": 8
+    },
+    {
+      "name": "ridge_q",
+      "family": "q_linear",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 0.08333333333333333,
+      "test_match": 0.0,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 1.0,
+      "test_score_margin": 0.00011452910678855233,
+      "test_pred_hist": {
+        "1": 0,
+        "2": 4,
+        "3": 0
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.04265999887138605,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.19642857142857142,
+      "latency_ok": true,
+      "rank": 9
+    },
+    {
+      "name": "mlp_q",
+      "family": "q_net",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 0.25,
+      "test_match": 0.0,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 1.0,
+      "test_score_margin": 0.32712436406646994,
+      "test_pred_hist": {
+        "1": 0,
+        "2": 4,
+        "3": 0
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.019859999883919954,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.19642857142857142,
+      "latency_ok": true,
+      "rank": 10
+    },
+    {
+      "name": "oracle_clf",
+      "family": "clf",
+      "label_key": "utility",
+      "reward_key": null,
+      "oracle_key": "utility",
+      "train_match": 1.0,
+      "test_match": 0.75,
+      "train_groups": 12,
+      "test_groups": 4,
+      "test_collapse": 0.75,
+      "test_score_margin": 0.7951265225152045,
+      "test_pred_hist": {
+        "1": 3,
+        "2": 1,
+        "3": 0
+      },
+      "test_oracle_hist": {
+        "1": 4,
+        "2": 0,
+        "3": 0
+      },
+      "latency_ms": 0.039489998016506433,
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "selection_score": 0.33392857142857146,
+      "latency_ok": true,
+      "rank": 4
+    }
+  ],
+  "replay": {
+    "fixed_1": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": null,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "fixed_2": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": null,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "fixed_3": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": null,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "constant_1": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "constant_2": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "constant_3": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "rule": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "rf_utility": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "pairwise": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "rf_pair": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "ridge_q": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "mlp_q": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "oracle_clf": {
+      "episode_intercept_rate": 0.3571428571428571,
+      "lift_vs_best_fixed": 0.0,
+      "n_scenes": 2,
+      "delta": 15.0
+    },
+    "_best_fixed": 0.3571428571428571
+  }
+}
