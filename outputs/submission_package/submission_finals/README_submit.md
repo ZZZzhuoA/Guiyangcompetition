@@ -40,9 +40,9 @@ submission_package/          ← 拷这一整个文件夹
 
 官方拦截率 CSV 默认在 `--input` 及其上一级自动找 `文件实验数据路径与结果_72mb.csv`。找不到再给 `--results`。正式间隔若是 20 秒，下面所有 `--delta 15` 改成 `20`。
 
-空行 / 空单元格会被跳过，不会再因 `float(None)` 崩掉。建集 stderr 有进度条。`outputs/finals_slice/_ckpt/` 和 `outputs/finals_seq/_ckpt/` 每做完一个场景就落盘；中断后**再跑同一条命令**会跳过已完成场景。成功写出 `training_samples.csv` 后 `_ckpt` 会删掉。只有要推倒重来才加 `--fresh`。
+空行 / 空单元格会被跳过，不会再因 `float(None)` 崩掉。建集 stderr 有进度条。`outputs/finals_slice/_ckpt/` 每做完一个场景就落盘；中断后**再跑同一条命令**会跳过已完成场景。成功后 `_ckpt` 仍保留，便于重新训练和复核标签；只有要推倒重来才加 `--fresh`。检查点同时记录 `delta`、idle 抽样比例等构造参数，参数改变时会要求 `--fresh`。
 
-**不要一上来跑 `run_on_site.py`。** 那条会把建集、对比、写 `policy.pkl` 串成一次；对比失败还得从当前步重来，但命令本身看不出该从哪一步接着干。按下面 0→6 逐步跑，哪一步失败只重跑那一步。
+可以直接使用 `run_on_site.py` 完成真实切片建集、候选对比、判读和模型导出；它默认只跑真实观测切片。需要比较带历史窗口的贯序候选时，再显式加 `--with-seq`。
 
 ```powershell
 cd submission_package
@@ -51,26 +51,30 @@ pip install numpy
 # 0. 核对样本（快）。n_runs 等于叶子目录数，缺号正常
 python scripts/inspect_finals_samples.py --input kemu6_data_72mb
 
-# 1. 单切片集。约 2s 取一个候选点，不要扫每条 0.5s 记录
-python scripts/build_slice_set.py --input kemu6_data_72mb --output outputs/finals_slice --time-stride 2
+# 1. 真实观测切片集：每个真实实验按 delta 秒形成一个区间转移
+python scripts/build_slice_set.py --input kemu6_data_72mb --output outputs/finals_slice --delta 15 --workers 4 --idle-keep-ratio 0.20
 # 中断后原样再跑上一行。推倒重来才加 --fresh
 
-# 2. 贯序集。独立于第 1 步，失败不必重做 slice
-python scripts/build_seq_set.py --input kemu6_data_72mb --output outputs/finals_seq --delta 15
-
-# 3. 对比单切片 10 个候选。写成 rf_pair.pkl 等，不覆盖 policy.pkl
+# 2. 对比真实切片的 10 个候选。写成各候选 pkl，不覆盖 policy.pkl
 python scripts/compare_finals_models.py --dataset outputs/finals_slice --output outputs/finals_model
 
-# 4. 对比贯序 11 个候选。不覆盖 policy.pkl
-python scripts/compare_finals_models.py --seq --dataset outputs/finals_seq --output outputs/finals_model_ts
+# 3. 判读数据、价值、后悔值和 BLOCK
+python scripts/diagnose_finals_models.py --compare outputs/finals_model/compare.json --dataset outputs/finals_slice
 
-# 5. 写出提交用 policy.pkl = rf_pair（diagnose 有 BLOCK 时也锁这个）
+# 4. 按最终决定导出提交模型；尚未确定时先沿用 rf_pair
 python scripts/train_finals_model.py --dataset outputs/finals_slice --output outputs/finals_model --model rf_pair
 
-# 6. 判读
-python scripts/diagnose_finals_models.py --compare outputs/finals_model/compare.json --dataset outputs/finals_slice
-python scripts/diagnose_finals_models.py --compare outputs/finals_model_ts/compare.json --dataset outputs/finals_seq
+# 可选：带历史窗口的真实贯序流程，需要显式启用
+python scripts/run_on_site.py --input kemu6_data_72mb --with-seq
 ```
+
+`--with-seq` 只负责构造、训练和比较贯序候选，默认提交模型仍是单切片的 `rf_pair`。如果贯序判读结果通过 BLOCK 检查并决定提交，例如选择 `seq_pair`，再单独导出它的 `policy.pkl`：
+
+```powershell
+python scripts/train_finals_model.py --dataset outputs/finals_seq --output outputs/finals_model_ts --model seq_pair
+```
+
+当前包的默认模型位置是 `outputs/finals_model/policy.pkl`；确认切换后可执行 `Copy-Item outputs/finals_model_ts/policy.pkl outputs/finals_model/policy.pkl -Force`，再用 `scripts/check_seq_inference.py` 检查历史缓存和延迟。
 
 找不到结果表时第 0/1/2 步加 `--results 文件实验数据路径与结果_72mb.csv`。赛方电脑不要加 `--with-replay`（那是本地玩具世界）。
 
@@ -203,11 +207,11 @@ kemu6_data_72mb/
 - 拦截性能最佳 → 2
 - 综合效益最优 → 3
 
-结果表「实验名称」是场景目录，「实验次数」是 `_1/_2/_3`。对不上再退回 `Stu_SJZS.S_LJCL`（合成数据才用文件夹名 `sample_000_s1`）。三次重复若策略相同会合并，官方拦截率取平均。同一场景若只有一种策略，t0 的 1/2/3 对照用分叉仿真补。
+结果表「实验名称」是场景目录，「实验次数」是 `_1/_2/_3`。对不上再退回 `Stu_SJZS.S_LJCL`（合成数据才用文件夹名 `sample_000_s1`）。三次重复会作为同一场景下的独立真实轨迹读取。真实切片不再从某一条轨迹模拟其它策略；缺少策略共同支持的场景只能作为原始观测保存，不能提供完整的三策略匹配组。
 
 赛方 CSV 可能是 GBK 而不是 UTF-8；有的表第一行是表头、第二三行是单位/说明、第四行才是数据。读表时会自动试编码并跳过表头下的说明行。
 
-开局 t0 的三策略标签用官方拦截率（对上了结果 CSV），对不上才退回 HealthState 统计。中段决策点三种策略已经分叉，仍用本地仿真补对照。
+每条真实轨迹都按决策时刻保存 `(x_t, 实际策略, 区间收益, x_next)`。训练和测试先按场景划分，再在各自划分内用可观测态势匹配相似时刻，估计三种策略的条件收益；测试标签不参与训练匹配。
 
 | 路径 | 内容 |
 | --- | --- |
@@ -237,13 +241,13 @@ python scripts/inspect_finals_samples.py --input kemu6_data_72mb
 
 ## 4. 训练流水线与参数
 
-赛方电脑用第 1 节的 **0→6 分步**。`run_finals_pipeline.py` 是早期一键脚本：只建**单切片**集、只训 **`rf_pair` 一个模型**，不建贯序集、不训另外 20 个候选、不做对比和判读。`run_on_site.py` 会串完全部步骤，中途失败时不如分步清楚。
+赛方电脑的主流程是“真实观测切片 → 场景级划分 → 相似态势匹配 → 候选训练与评估 → 导出 `policy.pkl`”。`run_on_site.py` 默认串完这条流程；`--with-seq` 会额外构造真实贯序集：每条真实 run 保留历史窗口、实际动作、区间收益和下一状态，再由相似历史态势估计其它策略的条件收益。贯序结果单独评估，不混入真实切片的默认结论。
 
 ### 本地合成数据（赛方电脑跳过）
 
 ```powershell
 python scripts/make_finals_synth_data.py --output outputs/finals_synth --n-scenes 6 --seed 7
-python scripts/build_slice_set.py --input outputs/finals_synth --output outputs/finals_slice --time-stride 2
+python scripts/build_slice_set.py --input outputs/finals_synth --output outputs/finals_slice --delta 15 --idle-keep-ratio 1.0
 python scripts/build_seq_set.py --input outputs/finals_synth --output outputs/finals_seq --delta 15
 python scripts/compare_finals_models.py --dataset outputs/finals_slice --output outputs/finals_model
 python scripts/compare_finals_models.py --seq --dataset outputs/finals_seq --output outputs/finals_model_ts
@@ -284,9 +288,11 @@ worst latency 7.14ms (budget 50ms)
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `--delta` | 15 | 决策间隔，单位是**秒**。样本按 0.5s 记录时 15s = 30 拍。正式若是 20 秒就改成 20，建集和回放都要一致 |
-| `--n-ticks` | 120 | **不是赛方限制。** 造合成数据时：本地世界滚多少拍；建集时：`time_frac` 的分母，以及分叉仿真最多再往前跑几拍。真实 CSV 的局长由 `FZTime` 决定，评估时赛方跑到场景结束，我们管不着。造数脚本默认 220，建集默认 120，推理缓存默认 220，三者没对齐——真实数据到手后应改成实际局长，否则 `time_frac` 会偏。 |
-| `--max-mid-slices` | 4 / 3 | 每局除 t0 外最多保留几个中段决策点 |
-| `--time-stride` | 2 | 单切片候选点间隔（秒）。0.5s 记录下默认约每 4 拍取一点，并保留 t0 和最后一拍 |
+| `--n-ticks` | 120 | 旧参数兼容；真实切片的轨迹长度由 CSV 的时间列决定 |
+| `--delta` | 15 | 相邻真实观测区间的决策间隔（秒）；正式间隔为 20 秒时改成 20 |
+| `--max-mid-slices` | 0 | 每条真实轨迹最多保留的区间数；0 表示全部区间 |
+| `--idle-keep-ratio` | 0.20 | 无机会、无拦截变化的 idle 区间保留比例；正收益和 hard negative 始终保留 |
+| `--workers` | 4 | 按场景并行构造；内存紧张时设为 2 |
 | `--fresh` | 关 | 忽略 `outputs/.../_ckpt`，从头建集。默认续传 |
 | `--test-ratio` | 0.25 | 按**场景**切分，不是按行，避免同局切片同时进训练和测试 |
 | `--replay-scenes` | 3 | 周期回放的场景数；赛方电脑不要开 `--with-replay` |
@@ -298,7 +304,7 @@ worst latency 7.14ms (budget 50ms)
 | `models.RandomForestUtility` | `n_trees` / `max_depth` / `min_samples_leaf` / `feature_fraction` | 12 / 4 / 6 / 0.75 |
 | `models.PairwiseLogistic` | `epochs` / `learning_rate` / `l2` | 200 / 0.08 / 0.003 |
 | `models.StrategyScorer` | `pairwise_weight` | 0.35（`rf_pair` = 0.65 森林 + 0.35 pairwise） |
-| `models.kind_weights` | 样本权重 | `t0`=3.0，`fork`/`slice`=2.0，`onpolicy`=0.3 |
+| `models.kind_weights` | 样本权重 | `observed_positive`=2.0，`observed_hard_negative`=1.0，`observed_idle`=0.2 |
 | `reward.GAMMA` | 折扣 | 0.85（**必须与势函数 shaping 用的同一个值**，否则策略不变性不成立） |
 | `reward.MIX_LAMBDA` | mix 里终局项权重 | 0.25 |
 | `reward.LEAK_HT_PENALTY` | 高威胁漏防修正 | 0.05 |
@@ -338,17 +344,20 @@ python scripts/diagnose_finals_models.py --compare outputs/finals_model/compare.
 
 | 字段 | 含义 |
 | --- | --- |
-| `train_match` / `test_match` | 与 oracle 策略的一致率。oracle 统一按赛方主指标定，贯序集用 `r_term` |
-| `train_groups` / `test_groups` | 参与统计的对照组数。只有含 ≥2 种策略的组才算 |
+| `train_match` / `test_match` | 与 oracle 策略的一致率。真实观测切片按整局拦截率的条件收益定；贯序集按历史态势匹配后的 return-to-go 条件收益定 |
+| `train_groups` / `test_groups` | 有唯一最优策略、可计算 match 的对照组数 |
+| `test_total_groups` / `test_tied_groups` | 所有完整三策略匹配组，以及最优策略差距不超过 0.01 的近似并列组 |
 | `test_collapse` | 最高频策略占比，1.0 即塌缩成固定策略 |
 | `test_score_margin` | 三策略打分的最大差 |
 | `latency_ms` | 单次推荐耗时，序列模型连编码一起计时 |
+| `test_policy_value` | 匹配测试态势上模型实际选中策略的平均拦截收益 |
+| `test_mean_regret` | 与该态势 oracle 最优收益的平均差距，越低越好 |
+| `test_lift_vs_best_fixed_matched` | 相对测试集上最佳固定策略的收益增量 |
 | `episode_intercept_rate` | 周期回放的整局拦截率，**这才是赛方主指标** |
 | `lift_vs_best_fixed` | 相对**最好的固定策略**的增量 |
 | `selection_score` | 加权总分，`rank` 是排序 |
 
-**第三层：选模打分**。硬门是延迟：超过 50ms 直接判不可提交。有周期回放时
-`0.55×整局拦截率 + 0.20×lift(截断±0.2归一) + 0.15×match + 0.10×多样性`；没有回放时退化成 `0.7×match + 0.3×多样性`。
+**第三层：选模打分**。硬门是延迟：超过 50ms 直接判不可提交。有周期回放时使用整局拦截率和回放 lift；真实切片没有回放时，主指标是 `test_policy_value`，`test_mean_regret` 和 `test_match` 只作轻量辅助，避免命中率高但实际拦截收益低的模型排第一。
 
 ### 判定规则
 
@@ -358,7 +367,7 @@ python scripts/diagnose_finals_models.py --compare outputs/finals_model/compare.
 | --- | --- |
 | `latency_ms > 50` | 超时延预算 |
 | `test_score_margin ≈ 0` | 三策略打分并列，没有区分能力，输出等价于固定策略 |
-| `lift_vs_best_fixed ≤ 0` | 打不过锁死一个策略，整套流程不值得提交 |
+| `lift_vs_best_fixed ≤ 0` 或 `test_lift_vs_best_fixed_matched ≤ 0` | 打不过锁死一个策略，整套流程不值得提交 |
 | 所有模型 `episode_intercept_rate` 相同 | 回放对策略选择不敏感，权重最高那一项没有分辨力，排序不可信 |
 | oracle 在测试集上恒为一个策略 | match 退化成「有没有猜中这一个」 |
 
@@ -388,21 +397,21 @@ python scripts/diagnose_finals_models.py --compare outputs/finals_model/compare.
 
 1. 判读脚本报告里该模型无阻塞项
 2. `chosen` 与它一致
-3. `lift_vs_best_fixed` 明显为正（不是 0，不是噪声级的正数）
+3. `lift_vs_best_fixed` 或 `test_lift_vs_best_fixed_matched` 明显为正（不是 0，不是噪声级的正数）
 
 然后才改 `registry.DEFAULT_SUBMIT`，重训、重打包、重跑隔离验证。
 
 ---
 
-## 6. 当前状态：合成数据上指标是瞎的
+## 6. 合成数据与真实数据的边界
 
-必须写在这里，否则容易误读输出。在 `outputs/finals_synth` 上：
+`outputs/finals_synth` 只用于检查 CSV 读取、特征构造、断点续建、模型导出和在线推理，不能代替赛方真实实验结果。合成世界的三种策略差异、拦截时刻和场景分布都可能与真实数据不同。
 
-- `r_delta` 在 Δ=15 时 48 行全为 0（Δ=40 才出信号），重建世界要 20 拍以上才落下第一次拦截
-- 16 个对照组只有 3 组的 `r_term` 在三策略间有差异
-- 周期回放里 `fixed_1/2/3` 和所有候选的整局拦截率**完全相同**，`lift` 结构性恒为 0
-- 6 个贯序/时间序列候选里 5 个的 `test_score_margin` 是 0
+真实数据建集后应重点检查：
 
-共同根因是**本地仿真器的 `_assign` 对策略 1/2/3 不敏感**。这一条不解决，任何选模指标都没有意义——所以现在 `DEFAULT_SUBMIT` 仍是 `rf_pair`，没有按 `chosen` 换过。
+- `summary.json` 中 `observed_positive`、`observed_hard_negative` 和 `observed_idle` 的数量；
+- `compare.json` 中每个模型的 `test_policy_value`、`test_mean_regret` 和 `test_lift_vs_best_fixed_matched`；
+- `matching.train/test` 中的共同支持数量、近邻距离和并列组数量；
+- `split.json` 是否按场景划分，且训练集、测试集都包含三种策略。
 
-真实样本到手后的排查顺序见 `docs/finals_realtime_design.md` 第 5.5 节。
+只有真实测试态势上的收益 lift 稳定为正，并且排序第一模型没有 BLOCK，才考虑替换默认 `rf_pair`。

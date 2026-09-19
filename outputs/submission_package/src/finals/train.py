@@ -12,6 +12,7 @@ import numpy as np
 from src.finals.features import FEATURE_NAMES
 from src.finals.infer import FinalsPolicy
 from src.finals.metrics import attach_selection, group_match, recommend_latency_ms
+from src.finals.matching import build_matched_groups, is_observed_dataset
 from src.finals.models import kind_weights
 from src.finals.registry import COMPARE_NAMES, DEFAULT_SUBMIT, MODEL_CATALOG, make_model
 from src.finals.schema import STRATEGIES
@@ -37,6 +38,18 @@ OUTCOME_KEYS = (
     "leak_rate",
     "cost",
     "cost_eff",
+)
+
+OBSERVED_ARRAY_KEYS = (
+    "run_id",
+    "replicate_id",
+    "time_next",
+    "intercept_delta",
+    "reward_delta",
+    "return_to_go",
+    "episode_intercept_rate",
+    "has_opportunity",
+    "dataset_mode",
 )
 
 
@@ -130,6 +143,9 @@ def load_arrays(dataset_dir: Path) -> dict:
     if "x_hist" in packed.files:
         data["x_hist"] = align_hist(packed["x_hist"], stored)
     for key in ("a_prev", "hist_len"):
+        if key in packed.files:
+            data[key] = packed[key]
+    for key in OBSERVED_ARRAY_KEYS:
         if key in packed.files:
             data[key] = packed[key]
     # 旧版 NPZ 没有保存 outcome 列。直接从已经生成的 CSV 补齐，避免为了
@@ -234,8 +250,39 @@ def scene_split(scene_id: np.ndarray, test_ratio: float = 0.25, seed: int = 0) -
     return ~test, test
 
 
+def split_training_views(
+    data: dict,
+    train_mask: np.ndarray,
+    test_mask: np.ndarray,
+) -> tuple[dict, np.ndarray, dict, np.ndarray, dict | None]:
+    """真实独立轨迹先切场景，再在各自 split 内做相似态势匹配。"""
+    if not is_observed_dataset(data):
+        return data, train_mask, data, test_mask, None
+    train_data, train_diag = build_matched_groups(data, train_mask)
+    test_data, test_diag = build_matched_groups(data, test_mask)
+    train_all = np.ones(len(train_data["strategy"]), dtype=bool)
+    test_all = np.ones(len(test_data["strategy"]), dtype=bool)
+    return train_data, train_all, test_data, test_all, {
+        "method": "split_local_knn",
+        "train": train_diag,
+        "test": test_diag,
+        "note": "先按 scene 切分，再分别匹配；测试态势及其收益不参与训练匹配。",
+    }
+
+
 def write_split(dataset_dir: Path, data: dict, train_mask: np.ndarray, test_mask: np.ndarray, test_ratio: float, seed: int = 0) -> dict:
     """把按场景切分的训练/测试集落盘。没有单独的测试 CSV：测试就是这些 scene_id 对应的行。"""
+    def count_points(mask: np.ndarray, with_strategy: bool = False) -> int:
+        if with_strategy:
+            return len({
+                (int(scene), int(strategy), float(time))
+                for scene, strategy, time in zip(data["scene_id"][mask], data["strategy"][mask], data["time"][mask])
+            })
+        return len({
+            (int(scene), float(time))
+            for scene, time in zip(data["scene_id"][mask], data["time"][mask])
+        })
+
     payload = {
         "test_ratio": float(test_ratio),
         "seed": int(seed),
@@ -243,7 +290,11 @@ def write_split(dataset_dir: Path, data: dict, train_mask: np.ndarray, test_mask
         "test_scenes": sorted({int(s) for s in data["scene_id"][test_mask]}),
         "n_train_rows": int(train_mask.sum()),
         "n_test_rows": int(test_mask.sum()),
-        "note": "按场景切分，同一局不会同时出现在训练和测试里。测试集不另存 CSV。",
+        "n_train_decision_times": count_points(train_mask),
+        "n_test_decision_times": count_points(test_mask),
+        "n_train_action_time_samples": count_points(train_mask, with_strategy=True),
+        "n_test_action_time_samples": count_points(test_mask, with_strategy=True),
+        "note": "按场景切分，同一局不会同时出现在训练和测试里。rows 是数据行数；decision_times 是去重后的场景-时刻数；action_time_samples 还区分策略。",
     }
     path = Path(dataset_dir) / "split.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -254,19 +305,22 @@ def train_policy(dataset_dir: Path, output_dir: Path, test_ratio: float = 0.25, 
     data = load_arrays(dataset_dir)
     train_mask, test_mask = scene_split(data["scene_id"], test_ratio=test_ratio)
     split = write_split(dataset_dir, data, train_mask, test_mask, test_ratio)
-    weights = kind_weights(data["kind"])
+    train_data, train_view_mask, test_data, test_view_mask, matching = split_training_views(
+        data, train_mask, test_mask
+    )
+    weights = kind_weights(train_data["kind"])
     scorer = make_model(model_name)
-    fit_scorer(scorer, data, train_mask, weights)
+    fit_scorer(scorer, train_data, train_view_mask, weights)
     policy = FinalsPolicy(scorer=scorer)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_path = output_dir / "policy.pkl"
     policy.save(model_path)
 
-    t0 = _counterfactual_mask(data["kind"], data["group_id"], data["strategy"]) & test_mask
-    metrics = evaluate_groups(scorer, data, t0)
-    train_t0 = _counterfactual_mask(data["kind"], data["group_id"], data["strategy"]) & train_mask
-    train_metrics = evaluate_groups(scorer, data, train_t0)
+    test_cf = _counterfactual_mask(test_data["kind"], test_data["group_id"], test_data["strategy"])
+    metrics = evaluate_groups(scorer, test_data, test_cf & test_view_mask)
+    train_cf = _counterfactual_mask(train_data["kind"], train_data["group_id"], train_data["strategy"])
+    train_metrics = evaluate_groups(scorer, train_data, train_cf & train_view_mask)
     summary = {
         "model_path": str(model_path),
         "model_name": model_name,
@@ -274,8 +328,9 @@ def train_policy(dataset_dir: Path, output_dir: Path, test_ratio: float = 0.25, 
         "n_features": int(data["x"].shape[1]),
         "n_train": int(train_mask.sum()),
         "n_test": int(test_mask.sum()),
-        "label_key": label_key(scorer, data),
+        "label_key": label_key(scorer, train_data),
         "split": split,
+        "matching": matching,
         "train_groups": train_metrics,
         "test_groups": metrics,
         "strategies": list(STRATEGIES),
@@ -297,31 +352,36 @@ def compare_models(
     data = load_arrays(dataset_dir)
     train_mask, test_mask = scene_split(data["scene_id"], test_ratio=test_ratio)
     split = write_split(dataset_dir, data, train_mask, test_mask, test_ratio)
-    weights = kind_weights(data["kind"])
-    cf = _counterfactual_mask(data["kind"], data["group_id"], data["strategy"])
+    train_data, train_view_mask, test_data, test_view_mask, matching = split_training_views(
+        data, train_mask, test_mask
+    )
+    weights = kind_weights(train_data["kind"])
+    train_cf = _counterfactual_mask(train_data["kind"], train_data["group_id"], train_data["strategy"])
+    test_cf = _counterfactual_mask(test_data["kind"], test_data["group_id"], test_data["strategy"])
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     fitted = {}
     rows = []
     for name in names:
         scorer = make_model(name)
-        fit_scorer(scorer, data, train_mask, weights)
+        fit_scorer(scorer, train_data, train_view_mask, weights)
         fitted[name] = scorer
         with (output_dir / f"{name}.pkl").open("wb") as stream:
             pickle.dump(scorer, stream)
-        train_m = evaluate_groups(scorer, data, cf & train_mask)
-        test_m = evaluate_groups(scorer, data, cf & test_mask)
+        train_m = evaluate_groups(scorer, train_data, train_cf & train_view_mask)
+        test_m = evaluate_groups(scorer, test_data, test_cf & test_view_mask)
         rows.append(
             {
                 "name": name,
                 "family": MODEL_CATALOG[name]["family"],
-                "label_key": label_key(scorer, data),
+                "label_key": label_key(scorer, train_data),
                 "reward_key": getattr(scorer, "reward_key", None),
                 "oracle_key": test_m.get("oracle_key"),
                 "train_match": train_m["match"],
                 "test_match": test_m["match"],
                 "train_groups": train_m["n_groups"],
                 "test_groups": test_m["n_groups"],
+                "test_total_groups": test_m.get("n_total_groups", test_m["n_groups"]),
                 "train_tied_groups": train_m.get("n_tied_groups", 0),
                 "test_tied_groups": test_m.get("n_tied_groups", 0),
                 "test_collapse": test_m.get("collapse"),
@@ -329,10 +389,15 @@ def compare_models(
                 "test_score_margin": test_m.get("mean_score_margin"),
                 "test_pred_hist": test_m["pred_hist"],
                 "test_oracle_hist": test_m["oracle_hist"],
+                "test_policy_value": test_m.get("mean_policy_value"),
+                "test_oracle_value": test_m.get("mean_oracle_value"),
+                "test_mean_regret": test_m.get("mean_regret"),
+                "test_fixed_policy_values": test_m.get("fixed_policy_values"),
+                "test_lift_vs_best_fixed_matched": test_m.get("lift_vs_best_fixed_matched"),
                 "latency_ms": recommend_latency_ms(
                     scorer,
-                    data["x"][train_mask],
-                    history=history_kwargs(scorer, data, train_mask),
+                    train_data["x"][train_view_mask],
+                    history=history_kwargs(scorer, train_data, train_view_mask),
                 ),
             }
         )
@@ -362,9 +427,10 @@ def compare_models(
         "default_submit": DEFAULT_SUBMIT,
         "chosen": chosen,
         "split": split,
+        "matching": matching,
         "target_diagnostics": {
-            "train": target_diagnostics(data, cf & train_mask),
-            "test": target_diagnostics(data, cf & test_mask),
+            "train": target_diagnostics(train_data, train_cf & train_view_mask),
+            "test": target_diagnostics(test_data, test_cf & test_view_mask),
         },
         "note": "chosen 只是当前指标排序，不会覆盖 policy.pkl。赛方 CSV 上的测试是 split.json 里那些测试场景的 group_match；--with-replay 用的是本地玩具世界，不是赛方样本。",
         "rows": rows,
@@ -425,7 +491,8 @@ def target_diagnostics(data: dict, mask: np.ndarray) -> dict:
         if len({int(data["strategy"][i]) for i in idxs}) < 2:
             continue
         values = np.asarray([target[i] for i in idxs], dtype=float)
-        if float(np.max(values) - np.min(values)) <= 1e-12:
+        best_value = float(np.max(values))
+        if int(np.sum(np.abs(values - best_value) <= 1e-12)) != 1:
             tied += 1
             continue
         best = int(data["strategy"][idxs[int(np.argmax(values))]])
@@ -442,7 +509,7 @@ def target_diagnostics(data: dict, mask: np.ndarray) -> dict:
 
 def evaluate_groups(scorer, data: dict, mask: np.ndarray) -> dict:
     if not np.any(mask):
-        return {"n_groups": 0, "n_tied_groups": 0, "match": None, "pred_hist": {s: 0 for s in STRATEGIES}, "oracle_hist": {s: 0 for s in STRATEGIES}, "collapse": 1.0, "random_baseline": 1.0 / len(STRATEGIES)}
+        return {"n_groups": 0, "n_total_groups": 0, "n_tied_groups": 0, "match": None, "pred_hist": {s: 0 for s in STRATEGIES}, "oracle_hist": {s: 0 for s in STRATEGIES}, "collapse": 1.0, "mean_policy_value": None, "mean_oracle_value": None, "mean_regret": None, "fixed_policy_values": {s: None for s in STRATEGIES}, "lift_vs_best_fixed_matched": None, "random_baseline": 1.0 / len(STRATEGIES)}
     oracle, key = oracle_label(data)
     out = group_match(
         scorer,

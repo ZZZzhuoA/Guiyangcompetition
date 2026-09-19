@@ -1,4 +1,4 @@
-"""赛方电脑一键：发现 CSV -> 建切片/贯序集 -> 训完全部 21 个候选 -> 对比+判读 -> 导出 policy.pkl。
+"""赛方电脑一键：发现 CSV -> 建真实切片集 -> 对比候选 -> 判读 -> 导出 policy.pkl。
 
 真实样本只在赛方电脑上。工作目录必须是 submission_package/ 这一层。
 
@@ -41,13 +41,25 @@ def _blocked(compare_path: Path, dataset_dir: Path) -> list[str]:
     return collect_blockers(summary, dataset_dir)
 
 
-def _completed_dataset(dataset_dir: Path) -> dict | None:
+def _completed_dataset(
+    dataset_dir: Path,
+    expected_mode: str | None = None,
+    expected_fields: dict | None = None,
+) -> dict | None:
     """显式复用完整数据集；存在 _ckpt 时说明仍需续建，不能误用旧成品。"""
     summary_path = Path(dataset_dir) / "summary.json"
     samples_path = Path(dataset_dir) / "training_samples.npz"
-    if (Path(dataset_dir) / "_ckpt").exists() or not summary_path.exists() or not samples_path.exists():
+    ckpt = Path(dataset_dir) / "_ckpt"
+    if ckpt.exists() and not (ckpt / "complete.json").exists():
         return None
-    return json.loads(summary_path.read_text(encoding="utf-8"))
+    if not summary_path.exists() or not samples_path.exists():
+        return None
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if expected_mode is not None and summary.get("mode") != expected_mode:
+        return None
+    if expected_fields and any(summary.get(key) != value for key, value in expected_fields.items()):
+        return None
+    return summary
 
 
 def main() -> None:
@@ -57,29 +69,45 @@ def main() -> None:
     parser.add_argument("--test-ratio", type=float, default=0.25)
     parser.add_argument("--n-ticks", type=int, default=120)
     parser.add_argument("--with-replay", action="store_true", help="额外用本地玩具世界做周期回放；那不是赛方 CSV 测试")
-    parser.add_argument("--skip-seq", action="store_true", help="只跑单切片 10 个候选，跳过贯序 11 个")
+    parser.add_argument("--with-seq", action="store_true", help="额外运行真实历史窗口贯序候选；默认只跑真实观测切片")
+    parser.add_argument("--skip-seq", action="store_true", help="兼容旧命令：跳过贯序候选")
     parser.add_argument("--results", type=Path, default=None, help="官方拦截率 CSV；默认在 --input 及其上一级自动找")
     parser.add_argument("--fresh", action="store_true", help="忽略建集 _ckpt，从头建 slice/seq")
-    parser.add_argument("--time-stride", type=float, default=2.0, help="slice 候选点时间步长（秒）")
-    parser.add_argument("--seq-workers", "--workers", dest="seq_workers", type=int, default=4, help="贯序建集并行进程数")
+    parser.add_argument("--workers", type=int, default=4, help="slice/seq 默认并行进程数")
+    parser.add_argument("--slice-workers", type=int, default=None, help="单独覆盖 slice 并行进程数")
+    parser.add_argument("--seq-workers", type=int, default=None, help="单独覆盖 seq 并行进程数")
+    parser.add_argument("--idle-keep-ratio", type=float, default=0.20, help="slice 空白零收益区间保留比例")
     parser.add_argument("--reuse-built", action="store_true", help="复用已完整生成的 slice/seq；有 _ckpt 的部分仍断点续建")
+    parser.add_argument("--slice-dir", type=Path, default=ROOT / "outputs" / "finals_slice")
+    parser.add_argument("--model-dir", type=Path, default=ROOT / "outputs" / "finals_model")
+    parser.add_argument("--seq-dir", type=Path, default=ROOT / "outputs" / "finals_seq")
+    parser.add_argument("--seq-model-dir", type=Path, default=ROOT / "outputs" / "finals_model_ts")
     args = parser.parse_args()
+    run_seq = bool(args.with_seq and not args.skip_seq)
 
     sample_root = args.input
     if not discover_run_dirs(sample_root):
         raise SystemExit(missing_sample_hint(sample_root))
 
-    slice_dir = ROOT / "outputs" / "finals_slice"
-    seq_dir = ROOT / "outputs" / "finals_seq"
-    model_dir = ROOT / "outputs" / "finals_model"
-    seq_model_dir = ROOT / "outputs" / "finals_model_ts"
+    slice_dir = args.slice_dir
+    seq_dir = args.seq_dir
+    model_dir = args.model_dir
+    seq_model_dir = args.seq_model_dir
 
     print(f"[1/6] inspect  {sample_root}")
     n_runs = len(discover_run_dirs(sample_root))
     print(f"      found {n_runs} CSV run folder(s)")
 
     print("[2/6] build slice set")
-    slice_summary = _completed_dataset(slice_dir) if args.reuse_built and not args.fresh else None
+    slice_summary = (
+        _completed_dataset(
+            slice_dir,
+            "observed_transitions",
+            {"delta": args.delta, "idle_keep_ratio": args.idle_keep_ratio},
+        )
+        if args.reuse_built and not args.fresh
+        else None
+    )
     if slice_summary is None:
         slice_summary = build_slice_set(
             sample_root,
@@ -87,16 +115,26 @@ def main() -> None:
             n_ticks=args.n_ticks,
             results_csv=args.results,
             resume=not args.fresh,
-            time_stride_s=args.time_stride,
+            delta=args.delta,
+            workers=args.slice_workers or args.workers,
+            idle_keep_ratio=args.idle_keep_ratio,
         )
     else:
         print(f"      reuse completed dataset: {slice_dir / 'training_samples.npz'}")
     _print("slice set", {k: slice_summary[k] for k in ("n_rows", "n_scenes", "n_runs", "n_scenes_with_3_replicates", "n_scenes_with_3_strategies", "n_official_matched", "kind_counts") if k in slice_summary})
 
     seq_summary = None
-    if not args.skip_seq:
+    if run_seq:
         print("[3/6] build seq set")
-        seq_summary = _completed_dataset(seq_dir) if args.reuse_built and not args.fresh else None
+        seq_summary = (
+            _completed_dataset(
+                seq_dir,
+                expected_mode="observed_sequential_transitions",
+                expected_fields={"delta": args.delta, "idle_keep_ratio": args.idle_keep_ratio},
+            )
+            if args.reuse_built and not args.fresh
+            else None
+        )
         if seq_summary is None:
             seq_summary = build_seq_set(
                 sample_root,
@@ -105,7 +143,8 @@ def main() -> None:
                 n_ticks=args.n_ticks,
                 results_csv=args.results,
                 resume=not args.fresh,
-                workers=args.seq_workers,
+                workers=args.seq_workers or args.workers,
+                idle_keep_ratio=args.idle_keep_ratio,
             )
         else:
             print(f"      reuse completed dataset: {seq_dir / 'training_samples.npz'}")
@@ -123,12 +162,12 @@ def main() -> None:
         delta=float(args.delta),
     )
     _print("slice compare", {"chosen": slice_compare.get("chosen"), "split": slice_compare.get("split"), "rows": [
-        {k: row.get(k) for k in ("name", "test_match", "test_groups", "test_score_margin", "latency_ms", "selection_score")}
+        {k: row.get(k) for k in ("name", "test_policy_value", "test_mean_regret", "test_lift_vs_best_fixed_matched", "test_match", "test_groups", "test_score_margin", "latency_ms", "selection_score")}
         for row in slice_compare["rows"]
     ]})
 
     seq_compare = None
-    if not args.skip_seq:
+    if run_seq:
         print(f"[5/6] train+compare {len(COMPARE_SEQ_NAMES)} sequential models")
         seq_compare = compare_models(
             seq_dir,
@@ -139,7 +178,7 @@ def main() -> None:
             delta=float(args.delta),
         )
         _print("seq compare", {"chosen": seq_compare.get("chosen"), "split": seq_compare.get("split"), "rows": [
-            {k: row.get(k) for k in ("name", "test_match", "test_groups", "test_score_margin", "latency_ms", "selection_score")}
+            {k: row.get(k) for k in ("name", "test_policy_value", "test_mean_regret", "test_lift_vs_best_fixed_matched", "test_match", "test_groups", "test_score_margin", "latency_ms", "selection_score")}
             for row in seq_compare["rows"]
         ]})
     else:

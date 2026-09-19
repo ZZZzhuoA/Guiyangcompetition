@@ -34,8 +34,8 @@ def main() -> None:
     parser.add_argument("--n-red", type=int, default=8)
     parser.add_argument("--n-ticks", type=int, default=220)
     parser.add_argument("--ticks-per-file", type=int, default=200)
-    parser.add_argument("--max-mid-slices", type=int, default=4)
-    parser.add_argument("--no-forks", action="store_true")
+    parser.add_argument("--max-mid-slices", type=int, default=0, help="每条实验最多保留区间数；0=全部")
+    parser.add_argument("--no-forks", action="store_true", help="旧参数兼容；真实观测建集不再分叉")
     parser.add_argument("--dense", action="store_true", help="Use dense-tick builder instead of slice set.")
     parser.add_argument("--skip-synth", action="store_true", help="Reuse existing scene CSVs.")
     parser.add_argument(
@@ -46,6 +46,8 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--results", type=Path, default=None, help="官方拦截率 CSV；默认自动找")
+    parser.add_argument("--delta", type=int, default=15)
+    parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
     source = args.input or args.synth_dir
     synth = None
@@ -80,6 +82,8 @@ def main() -> None:
             n_ticks=args.n_ticks,
             results_csv=args.results,
             resume=True,
+            delta=args.delta,
+            workers=args.workers,
         )
     model = train_policy(args.dataset_dir, args.model_dir)
     print(json.dumps({"synth": None if synth is None else {"n_scenes": synth["n_scenes"]}, "dataset": data, "model": model}, ensure_ascii=False, indent=2))

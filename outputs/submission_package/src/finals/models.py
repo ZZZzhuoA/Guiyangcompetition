@@ -217,5 +217,14 @@ class StrategyScorer:
 
 
 def kind_weights(kind: np.ndarray) -> np.ndarray:
-    mapping = {"t0": 3.0, "fork": 2.0, "slice": 2.0, "onpolicy": 0.3}
+    mapping = {
+        "t0": 3.0,
+        "fork": 2.0,
+        "slice": 2.0,
+        "onpolicy": 0.3,
+        "matched": 1.0,
+        "observed_positive": 2.0,
+        "observed_hard_negative": 1.0,
+        "observed_idle": 0.2,
+    }
     return np.array([mapping.get(str(k), 1.0) for k in kind], dtype=float)

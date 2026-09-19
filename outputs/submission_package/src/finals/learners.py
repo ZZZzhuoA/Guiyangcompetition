@@ -197,7 +197,8 @@ class SoftmaxPolicy:
             values = np.asarray([utility[i] for i in idxs], dtype=float)
             # 并列组没有分类标签；argmax 会无条件把第一行（通常是策略 1）
             # 当作正确答案，导致分类器人为塌缩到策略 1。
-            if float(np.max(values) - np.min(values)) <= 1e-12:
+            best_value = float(np.max(values))
+            if int(np.sum(np.abs(values - best_value) <= 1e-12)) != 1:
                 continue
             best = idxs[int(np.argmax(values))]
             xs.append(x[idxs[0]])

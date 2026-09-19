@@ -1,11 +1,7 @@
-"""贯序训练集：当前态势执行 a 一个间隔 Δ，再可选跑完。
+"""真实贯序训练集：历史窗口 + 实际动作 + 区间收益 + 下一状态。
 
-标签（见 src/finals/reward.py）：
-  r_delta   本段拦截增量 / 本局已出现蓝方数
-  r_term    此后一直用 a 的整局拦截率
-  mix       r_delta + λ r_term
-  r_shaped  r_delta + γΦ(x') - Φ(x) - 高威胁漏防修正，供 fitted-Q
-并记下间隔结束时的 x_next。
+每条 run 都独立读取，不从一条轨迹模拟其它策略。三策略条件收益在训练阶段
+按场景切分后由 matching.py 从相似历史态势估计，避免把 fork 标签混入训练。
 """
 
 from __future__ import annotations
@@ -25,6 +21,7 @@ from src.finals.dataset import (
     _sample_row,
     decision_times,
     inventory_catalog,
+    load_run,
     load_catalog_scene,
     load_run_catalog,
     missing_sample_hint,
@@ -46,7 +43,7 @@ from src.finals.reward import (
 from src.finals.schema import STRATEGIES, seconds_to_ticks
 from src.finals.sequence import WINDOW, build_window
 from src.finals.simulate import clone_world, continue_episode, run_episode, world_from_snapshot
-from src.finals.slice_set import drop_reason
+from src.finals.slice_set import _idle_kept, _terminal_intercepted, drop_reason
 from src.finals.snapshot import build_table_index, snapshot_from_tables
 
 LABEL_COLUMNS = (
@@ -63,6 +60,10 @@ LABEL_COLUMNS = (
     "done",
 )
 
+OBSERVED_SEQ_VERSION = 2
+
+# 下面的 fork 辅助函数只为兼容旧的内部调用保留；当前 build_seq_set 走的是
+# 文件中后面的 observed run 路径，不会调用它们，也不会把仿真标签写入新数据集。
 
 def _snapshot_from_logs(logs) -> object:
     health = [row for log in logs for row in log.health]
@@ -208,7 +209,7 @@ def _real_seq_from_runs(by_strategy: dict, snap, feat_dict: dict, ctx: DecisionC
     return out
 
 
-_SCENE_ERRORS = (TypeError, ValueError, KeyError, IndexError, AttributeError)
+_SCENE_ERRORS = (TypeError, ValueError, KeyError, IndexError, AttributeError, OSError)
 _SEQ_WORKER_OFFICIAL = None
 _SEQ_WORKER_CONFIG: tuple[int, int, int, int] | None = None
 
@@ -354,22 +355,218 @@ def _process_scene(
     return rows, dropped, extra
 
 
+def _process_observed_run(
+    scene_id: int,
+    run: dict,
+    run_number: int,
+    delta: int,
+    max_intervals: int,
+    idle_keep_ratio: float,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """从一条真实策略轨迹构造带历史窗口的观测转移。
+
+    一条 run 只包含实际执行过的一个策略；三策略标签由训练阶段的
+    matching.py 在场景内独立匹配得到。这里绝不从当前态势模拟其它策略。
+    """
+    strategy = int(run["strategy"])
+    replicate = int(run.get("replicate_id") or run_number)
+    run_id = str(run["directory"])
+    index = build_table_index(run["rhdl"], run["health"], run["lj"])
+    starts = decision_times(run["times"], float(delta))
+    ctx = DecisionContext(horizon=max(float(run["times"][-1]), float(delta)))
+    n_blue = max(1, int(run["n_blue"]))
+    terminal_intercepted = _terminal_intercepted(run)
+    episode_rate = terminal_intercepted / n_blue
+    hist_frames: list[np.ndarray] = []
+    hist_actions: list[int] = []
+    rows: list[dict] = []
+    dropped: list[dict] = []
+    extra: list[dict] = []
+    kept = 0
+
+    for time in starts:
+        next_time = time_at_or_after(run["times"], float(time) + float(delta))
+        if next_time <= float(time) + 1e-9:
+            continue
+        if max_intervals > 0 and kept >= max_intervals:
+            break
+        snap = snapshot_from_tables(
+            run["rhdl"], run["health"], run["lj"], time, strategy, index=index
+        )
+        feat_dict = extract_feature_dict(snap, context=ctx)
+        feat = dict_to_vector(feat_dict)
+        x_hist, a_prev, hist_len = build_window(hist_frames, hist_actions, feat)
+        hist_frames.append(feat)
+        hist_actions.append(strategy)
+
+        snap_next = snapshot_from_tables(
+            run["rhdl"], run["health"], run["lj"], next_time, strategy, index=index
+        )
+        ctx_next = copy.deepcopy(ctx)
+        ctx_next.commit(snap, feat_dict, strategy)
+        feat_next_dict = extract_feature_dict(snap_next, context=ctx_next)
+        feat_next = dict_to_vector(feat_next_dict)
+        intercepted_t = _already_intercepted(run["health"], time)
+        intercepted_next = _already_intercepted(run["health"], next_time)
+        intercept_delta = max(0, intercepted_next - intercepted_t)
+        return_to_go = max(0.0, terminal_intercepted - float(intercepted_t)) / n_blue
+        has_opportunity = bool(
+            float(feat_dict.get("n_alive", 0.0)) > 0.0
+            and (
+                float(feat_dict.get("n_can_links", 0.0)) > 0.0
+                or float(feat_dict.get("n_intercepting", 0.0)) > 0.0
+            )
+        )
+        if intercept_delta > 0:
+            kind = "observed_positive"
+        elif has_opportunity:
+            kind = "observed_hard_negative"
+        elif _idle_kept(scene_id, strategy, replicate, time, idle_keep_ratio):
+            kind = "observed_idle"
+        else:
+            dropped.append({
+                "scene_id": scene_id, "run_id": run_id, "strategy": strategy,
+                "time": float(time), "kind": "observed_idle", "reason": "idle_subsample",
+            })
+            ctx.commit(snap, feat_dict, strategy)
+            continue
+
+        done = abs(float(next_time) - float(run["times"][-1])) <= 1e-9
+        reward = segment_reward(
+            intercept_delta, n_blue,
+            potential(feat_dict), potential(feat_next_dict),
+            ht_leak_delta=0, gamma=GAMMA, done=done,
+        )
+        labels = {
+            **reward,
+            "r_term": float(return_to_go),
+            "mix": mix_label(reward["r_delta"], return_to_go),
+            "n_faced_delta": float(n_blue),
+            "n_faced_term": float(n_blue),
+            "done": 1.0 if done else 0.0,
+        }
+        outcome = {
+            "intercept_rate": float(return_to_go),
+            "leak_rate": float(max(0.0, 1.0 - episode_rate)),
+            "cost": float(run.get("cost", 0.0)),
+            "cost_eff": float(episode_rate / (0.35 + float(run.get("cost", 0.0)))),
+            "utility": float(return_to_go),
+        }
+        group_id = f"scene{scene_id}|run{run_number}|t{float(time):g}"
+        row = _sample_row(scene_id, time, strategy, feat, outcome, group_id, kind)
+        row.update({name: float(labels[name]) for name in LABEL_COLUMNS})
+        row.update({
+            "run_id": run_id,
+            "replicate_id": replicate,
+            "time_next": float(next_time),
+            "intercepted_t": float(intercepted_t),
+            "intercepted_next": float(intercepted_next),
+            "intercept_delta": float(intercept_delta),
+            "reward_delta": float(reward["r_delta"]),
+            "return_to_go": float(return_to_go),
+            "episode_intercept_rate": float(episode_rate),
+            "has_opportunity": 1.0 if has_opportunity else 0.0,
+            "label_source": str(run.get("label_source", "health")),
+        })
+        rows.append(row)
+        extra.append(_pack_seq_extra(feat_next, x_hist, a_prev, hist_len))
+        kept += 1
+        ctx.commit(snap, feat_dict, strategy)
+    return rows, dropped, extra
+
+
+def _build_catalog_scene(
+    scene_id: int,
+    entries: dict,
+    official,
+    delta: int,
+    max_intervals: int,
+    idle_keep_ratio: float,
+) -> tuple[int, list[dict], list[dict], list[dict], list[dict]]:
+    rows: list[dict] = []
+    dropped: list[dict] = []
+    extra: list[dict] = []
+    errors: list[dict] = []
+    run_number = 0
+    for strategy, strategy_entries in sorted(entries.items()):
+        for entry in strategy_entries:
+            run_number += 1
+            directory = Path(entry["directory"])
+            try:
+                run = load_run(directory, official=official)
+                run["strategy"] = int(strategy)
+                run_rows, run_dropped, run_extra = _process_observed_run(
+                    scene_id, run, run_number, delta, max_intervals, idle_keep_ratio
+                )
+                rows.extend(run_rows)
+                dropped.extend(run_dropped)
+                extra.extend(run_extra)
+            except _SCENE_ERRORS as exc:
+                errors.append({"directory": str(directory), "error": str(exc)})
+                dropped.append({
+                    "scene_id": scene_id, "run_id": str(directory),
+                    "strategy": int(strategy), "time": None, "kind": "run",
+                    "reason": f"skip:{exc}",
+                })
+    return scene_id, rows, dropped, extra, errors
+
+
+def _init_seq_worker(official, delta: int, max_intervals: int, idle_keep_ratio: float) -> None:
+    global _SEQ_WORKER_OFFICIAL, _SEQ_WORKER_CONFIG
+    _SEQ_WORKER_OFFICIAL = official
+    _SEQ_WORKER_CONFIG = (int(delta), int(max_intervals), float(idle_keep_ratio))
+
+
+def _seq_worker_task(scene: tuple[int, dict]):
+    if _SEQ_WORKER_OFFICIAL is None or _SEQ_WORKER_CONFIG is None:
+        raise RuntimeError("sequential worker was not initialized")
+    delta, max_intervals, idle_keep_ratio = _SEQ_WORKER_CONFIG
+    return _build_catalog_scene(
+        int(scene[0]), scene[1], _SEQ_WORKER_OFFICIAL,
+        delta, max_intervals, idle_keep_ratio,
+    )
+
+
 def build_seq_set(
     input_dir: Path,
     output_dir: Path,
     delta: int = 15,
-    max_mid_slices: int = 3,
+    max_mid_slices: int = 0,
     n_ticks: int = 120,
     results_csv: Path | None = None,
     resume: bool = True,
     workers: int | None = None,
+    idle_keep_ratio: float = 0.20,
 ) -> dict:
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     ckpt = SceneCheckpoint(output_dir)
+    version_path = ckpt.root / "builder.json"
+    builder_config = {
+        "version": OBSERVED_SEQ_VERSION,
+        "mode": "observed_sequential_transitions",
+        "delta": int(delta),
+        "max_intervals_per_run": int(max_mid_slices),
+        "idle_keep_ratio": float(idle_keep_ratio),
+    }
     if not resume:
         ckpt.clear()
+    elif ckpt.exists() and not version_path.exists():
+        raise ValueError("seq checkpoint 是旧版贯序数据；请使用新输出目录或加 --fresh")
+    if version_path.exists():
+        stored = json.loads(version_path.read_text(encoding="utf-8"))
+        if int(stored.get("version") or 0) != OBSERVED_SEQ_VERSION:
+            raise ValueError("seq checkpoint 版本不匹配；请加 --fresh")
+        mismatch = {
+            key: (stored.get(key), value)
+            for key, value in builder_config.items()
+            if stored.get(key) != value
+        }
+        if mismatch:
+            raise ValueError(f"seq checkpoint 构造参数不一致: {mismatch}；请沿用原参数或加 --fresh")
+    ckpt.root.mkdir(parents=True, exist_ok=True)
+    version_path.write_text(json.dumps(builder_config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     catalog, official, ingest = load_run_catalog(
         input_dir,
         results_csv=results_csv,
@@ -378,7 +575,7 @@ def build_seq_set(
     )
     if not catalog:
         raise ValueError(missing_sample_hint(input_dir))
-    remain = min(36, max(delta, n_ticks // 4))
+    idle_keep_ratio = float(np.clip(idle_keep_ratio, 0.0, 1.0))
     if resume:
         done, rows, dropped, extra = ckpt.load()
     else:
@@ -419,7 +616,7 @@ def build_seq_set(
         for scene_id, entries in scenes:
             accept(
                 _build_catalog_scene(
-                    scene_id, entries, official, delta, max_mid_slices, n_ticks, remain
+                    scene_id, entries, official, delta, max_mid_slices, idle_keep_ratio
                 )
             )
     elif scenes:
@@ -428,7 +625,7 @@ def build_seq_set(
         pool = ProcessPoolExecutor(
             max_workers=worker_count,
             initializer=_init_seq_worker,
-            initargs=(official, delta, max_mid_slices, n_ticks, remain),
+            initargs=(official, delta, max_mid_slices, idle_keep_ratio),
         )
         pending = {}
         scene_iter = iter(scenes)
@@ -465,16 +662,10 @@ def build_seq_set(
         raise ValueError("No sequential samples kept")
     x_next_rows, hist_x_rows, hist_a_rows, hist_len_rows = _unpack_seq_extra(extra)
     fieldnames = [
-        "scene_id",
-        "time",
-        "strategy",
-        "group_id",
-        "kind",
-        "intercept_rate",
-        "leak_rate",
-        "cost",
-        "cost_eff",
-        "utility",
+        "scene_id", "run_id", "replicate_id", "time", "time_next", "strategy",
+        "group_id", "kind", "intercepted_t", "intercepted_next", "intercept_delta",
+        "reward_delta", "return_to_go", "episode_intercept_rate", "has_opportunity",
+        "label_source", "intercept_rate", "leak_rate", "cost", "cost_eff", "utility",
         *LABEL_COLUMNS,
         "hist_len",
         *FEATURE_NAMES,
@@ -500,12 +691,24 @@ def build_seq_set(
             "x_hist": np.stack(hist_x_rows),
             "a_prev": np.stack(hist_a_rows),
             "hist_len": np.array(hist_len_rows, dtype=int),
+            "run_id": np.asarray([row["run_id"] for row in rows]),
+            "replicate_id": np.asarray([int(row["replicate_id"]) for row in rows], dtype=int),
+            "time_next": np.asarray([float(row["time_next"]) for row in rows], dtype=float),
+            "intercept_delta": np.asarray([float(row["intercept_delta"]) for row in rows], dtype=float),
+            "reward_delta": np.asarray([float(row["reward_delta"]) for row in rows], dtype=float),
+            "return_to_go": np.asarray([float(row["return_to_go"]) for row in rows], dtype=float),
+            "episode_intercept_rate": np.asarray([float(row["episode_intercept_rate"]) for row in rows], dtype=float),
+            "has_opportunity": np.asarray([float(row["has_opportunity"]) for row in rows], dtype=float),
+            "done": np.asarray([float(row["done"]) for row in rows], dtype=float),
+            "dataset_mode": np.asarray(["observed_sequential_transitions"]),
         },
     )
-    ckpt.clear()
     summary = {
-        "mode": "sequential_scoring",
+        "mode": "observed_sequential_transitions",
+        "version": OBSERVED_SEQ_VERSION,
         "delta": delta,
+        "max_intervals_per_run": max_mid_slices,
+        "idle_keep_ratio": idle_keep_ratio,
         "gamma": GAMMA,
         "mix_lambda": MIX_LAMBDA,
         "window": WINDOW,
@@ -525,6 +728,9 @@ def build_seq_set(
         "kind_counts": {kind: sum(1 for row in rows if row["kind"] == kind) for kind in sorted({row["kind"] for row in rows})},
         "label_means": {name: float(np.mean([row[name] for row in rows])) for name in ("r_delta", "r_term", "mix", "r_shaped", "shaping")},
         "csv": str(csv_path),
+        "checkpoint": str(ckpt.root),
+        "checkpoint_preserved": True,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    ckpt.mark_complete({"version": OBSERVED_SEQ_VERSION, "n_rows": len(rows)})
     return summary

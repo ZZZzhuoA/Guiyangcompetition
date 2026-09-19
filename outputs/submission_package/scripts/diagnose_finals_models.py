@@ -89,10 +89,14 @@ def diagnose_row(row: dict) -> list[tuple[str, str]]:
     if groups and tied_groups > int(groups):
         out.append((WARN, f"测试集中并列组 {tied_groups} 个，多于有效组 {groups} 个，标签区分度偏低"))
     lift = row.get("lift_vs_best_fixed")
+    lift_name = "整局回放 lift"
+    if lift is None:
+        lift = row.get("test_lift_vs_best_fixed_matched")
+        lift_name = "匹配测试价值 lift"
     if lift is not None and lift <= 0.0:
-        out.append((BLOCKER, f"整局拦截率相对最好的固定策略 lift={lift:+.4f}，打不过锁死一个策略"))
-    if "episode_intercept_rate" not in row:
-        out.append((WARN, "没有周期回放结果，不能据此定提交模型（跑 --with-replay）"))
+        out.append((BLOCKER, f"{lift_name}={lift:+.4f}，打不过锁死一个策略"))
+    if "episode_intercept_rate" not in row and row.get("test_policy_value") is None:
+        out.append((WARN, "既没有周期回放，也没有真实轨迹匹配价值，不能据此定提交模型"))
     if not out:
         out.append((OK, "无阻塞项"))
     return out
@@ -188,7 +192,7 @@ def main() -> None:
     print("=" * 96)
     header = (
         f"{'name':16s} {'trn_m':>6s} {'tst_m':>6s} {'grp':>4s} {'tie':>4s} {'collap':>6s} "
-        f"{'margin':>10s} {'lat_ms':>7s} {'ep_rate':>8s} {'lift':>8s} {'score':>6s}"
+        f"{'margin':>10s} {'lat_ms':>7s} {'value':>8s} {'regret':>8s} {'lift':>8s} {'score':>6s}"
     )
     print(header)
     print("-" * len(header))
@@ -198,7 +202,9 @@ def main() -> None:
             f"{_fmt(row.get('test_groups'), 'd'):>4s} {_fmt(row.get('test_tied_groups'), 'd'):>4s} "
             f"{_fmt(row.get('test_collapse'), '.3f'):>6s} "
             f"{_fmt(row.get('test_score_margin'), '.2e'):>10s} {_fmt(row.get('latency_ms'), '.2f'):>7s} "
-            f"{_fmt(row.get('episode_intercept_rate'), '.4f'):>8s} {_fmt(row.get('lift_vs_best_fixed'), '+.4f'):>8s} "
+            f"{_fmt(row.get('test_policy_value', row.get('episode_intercept_rate')), '.4f'):>8s} "
+            f"{_fmt(row.get('test_mean_regret'), '.4f'):>8s} "
+            f"{_fmt(row.get('test_lift_vs_best_fixed_matched', row.get('lift_vs_best_fixed')), '+.4f'):>8s} "
             f"{_fmt(row.get('selection_score'), '.3f'):>6s}"
         )
 
@@ -206,14 +212,14 @@ def main() -> None:
     print("=" * 96)
     print("逐模型判定")
     print("=" * 96)
-    submittable = []
+    non_blocked = []
     for row in rows:
         findings = diagnose_row(row)
         worst = BLOCKER if any(level == BLOCKER for level, _ in findings) else (
             WARN if any(level == WARN for level, _ in findings) else OK
         )
-        if worst == OK:
-            submittable.append(row["name"])
+        if worst != BLOCKER:
+            non_blocked.append(row["name"])
         print(f"\n{row['name']}  ->  {worst}")
         for level, msg in findings:
             print(f"  [{level:5s}] {msg}")
@@ -228,10 +234,10 @@ def main() -> None:
         for msg in blockers:
             print(f"    - {msg}")
         print(f"  提交模型保持 default_submit = {summary.get('default_submit')} 不变。")
-        if submittable:
-            print(f"  无阻塞项的其他候选：{', '.join(submittable)}")
-    elif submittable:
-        print(f"  无阻塞项的候选：{', '.join(submittable)}")
+        if non_blocked:
+            print(f"  无阻塞项的其他候选：{', '.join(non_blocked)}")
+    elif non_blocked:
+        print(f"  无阻塞项的候选：{', '.join(non_blocked)}")
         print(f"  指标排序第一：{summary.get('chosen')}")
         print("  确认这两者一致、且 lift 明显为正后，再改 registry.DEFAULT_SUBMIT。")
     else:

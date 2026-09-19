@@ -58,10 +58,23 @@ class SceneCheckpoint:
         self.rows_path = self.root / "rows.jsonl"
         self.dropped_path = self.root / "dropped.jsonl"
         self.extra_path = self.root / "extra.jsonl"
+        self.complete_path = self.root / "complete.json"
         self._done: set[int] | None = None
 
     def exists(self) -> bool:
         return self.done_path.exists() or (self.scenes_root.exists() and any(self.scenes_root.glob("*.json")))
+
+    def is_complete(self) -> bool:
+        return self.complete_path.exists()
+
+    def mark_complete(self, payload: dict | None = None) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        temp = self.root / ".complete.json.tmp"
+        temp.write_text(
+            json.dumps({"complete": True, **(payload or {})}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        temp.replace(self.complete_path)
 
     def load(self) -> tuple[set[int], list[dict], list[dict], list[dict]]:
         if not self.exists():
