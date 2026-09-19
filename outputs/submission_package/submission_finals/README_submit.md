@@ -64,9 +64,20 @@ python scripts/diagnose_finals_models.py --compare outputs/finals_model/compare.
 # 4. 按最终决定导出提交模型；尚未确定时先沿用 rf_pair
 python scripts/train_finals_model.py --dataset outputs/finals_slice --output outputs/finals_model --model rf_pair
 
-# 可选：带历史窗口的真实贯序流程，需要显式启用
+# 可选 A：一键构造并比较带历史窗口的真实贯序候选
 python scripts/run_on_site.py --input kemu6_data_72mb --with-seq
+
+# 可选 B：旧版贯序集没有跑完或存在旧版 _ckpt 时，单独用新逻辑从头重建
+python scripts/build_seq_set.py `
+  --input kemu6_data_72mb `
+  --output outputs/finals_seq `
+  --delta 15 `
+  --workers 4 `
+  --idle-keep-ratio 0.20 `
+  --fresh
 ```
+
+上面单独重建命令中的 `--fresh` 只用于清除旧版贯序检查点并从头生成。新版本开始构造后如果中断，续跑时执行同一命令但去掉 `--fresh`，程序会跳过已经完成的场景。
 
 `--with-seq` 只负责构造、训练和比较贯序候选，默认提交模型仍是单切片的 `rf_pair`。如果贯序判读结果通过 BLOCK 检查并决定提交，例如选择 `seq_pair`，再单独导出它的 `policy.pkl`：
 
