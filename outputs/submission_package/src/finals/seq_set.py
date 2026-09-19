@@ -22,8 +22,9 @@ from src.finals.dataset import (
     _already_intercepted,
     _sample_row,
     decision_times,
-    inventory_runs,
-    load_grouped_runs,
+    inventory_catalog,
+    load_catalog_scene,
+    load_run_catalog,
     missing_sample_hint,
     outcome_from_run,
     time_at_or_after,
@@ -309,16 +310,27 @@ def build_seq_set(
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    grouped, ingest = load_grouped_runs(input_dir, results_csv=results_csv)
-    if not grouped:
+    ckpt = SceneCheckpoint(output_dir)
+    if not resume:
+        ckpt.clear()
+    catalog, official, ingest = load_run_catalog(
+        input_dir,
+        results_csv=results_csv,
+        checkpoint_path=ckpt.root / "catalog.json",
+        resume=resume,
+    )
+    if not catalog:
         raise ValueError(missing_sample_hint(input_dir))
     remain = min(36, max(delta, n_ticks // 4))
-    ckpt = SceneCheckpoint(output_dir)
     if resume:
         done, rows, dropped, extra = ckpt.load()
     else:
-        ckpt.clear()
         done, rows, dropped, extra = set(), [], [], []
+    print(
+        f"seq catalog: {ingest.get('n_runs', 0)} run(s), {len(catalog)} scene(s); "
+        f"checkpoint: {ckpt.root}",
+        flush=True,
+    )
     if extra and rows and len(extra) != len(rows):
         raise ValueError(
             f"seq checkpoint extra ({len(extra)}) != rows ({len(rows)}); rerun with --fresh"
@@ -327,20 +339,31 @@ def build_seq_set(
         raise ValueError("seq checkpoint missing x_next/x_hist; rerun with --fresh")
     if done:
         print(f"resume seq: skip {len(done)} finished scene(s)", flush=True)
-    scenes = [(scene_id, by_strategy) for scene_id, by_strategy in sorted(grouped.items()) if scene_id not in done]
+    scenes = [(scene_id, entries) for scene_id, entries in sorted(catalog.items()) if scene_id not in done]
     bar = ProgressBar(len(scenes), prefix="seq")
-    for scene_id, by_strategy in scenes:
+    for scene_id, entries in scenes:
+        by_strategy, scene_load_errors = load_catalog_scene(entries, official)
+        if scene_load_errors:
+            ingest["n_load_errors"] = int(ingest.get("n_load_errors", 0)) + len(scene_load_errors)
+            ingest.setdefault("load_errors", []).extend(scene_load_errors)
         try:
+            if not by_strategy:
+                raise ValueError("no readable run in scene")
             scene_rows, scene_dropped, scene_extra = _process_scene(
                 scene_id, by_strategy, delta, max_mid_slices, n_ticks, remain
             )
         except _SCENE_ERRORS as exc:
             scene_rows, scene_dropped, scene_extra = [], [{"scene_id": scene_id, "time": None, "kind": "scene", "reason": f"skip:{exc}"}], []
+        for item in scene_load_errors:
+            scene_dropped.append(
+                {"scene_id": scene_id, "time": None, "kind": "load", "reason": f"skip:{item['error']}"}
+            )
         rows.extend(scene_rows)
         dropped.extend(scene_dropped)
         extra.extend(scene_extra)
         ckpt.save_scene(scene_id, scene_rows, scene_dropped, scene_extra)
         bar.update(extra=f"scene {scene_id}")
+        del by_strategy
     bar.close()
     if not rows:
         raise ValueError("No sequential samples kept")
@@ -391,9 +414,9 @@ def build_seq_set(
         "mix_lambda": MIX_LAMBDA,
         "window": WINDOW,
         "n_rows": len(rows),
-        "n_scenes": len(grouped),
-        "n_runs": ingest.get("n_runs", sum(len(by_strategy) for by_strategy in grouped.values())),
-        "n_scene_strategy_pairs": ingest.get("n_scene_strategy_pairs", len(grouped)),
+        "n_scenes": len(catalog),
+        "n_runs": ingest.get("n_runs", sum(len(entries) for by_strategy in catalog.values() for entries in by_strategy.values())),
+        "n_scene_strategy_pairs": ingest.get("n_scene_strategy_pairs", len(catalog)),
         "n_scenes_with_3_strategies": ingest.get("n_scenes_with_3_strategies", 0),
         "n_scenes_with_3_replicates": ingest.get("n_scenes_with_3_replicates", 0),
         "n_official_matched": ingest.get("n_official_matched", 0),
@@ -401,7 +424,7 @@ def build_seq_set(
         "n_features": len(FEATURE_NAMES),
         "n_dropped": len(dropped),
         "n_load_errors": ingest.get("n_load_errors", 0),
-        "runs": inventory_runs(grouped),
+        "runs": inventory_catalog(catalog),
         "kind_counts": {kind: sum(1 for row in rows if row["kind"] == kind) for kind in sorted({row["kind"] for row in rows})},
         "label_means": {name: float(np.mean([row[name] for row in rows])) for name in ("r_delta", "r_term", "mix", "r_shaped", "shaping")},
         "csv": str(csv_path),

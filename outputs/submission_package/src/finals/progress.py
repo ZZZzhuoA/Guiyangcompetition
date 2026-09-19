@@ -53,6 +53,7 @@ class SceneCheckpoint:
 
     def __init__(self, output_dir: Path):
         self.root = Path(output_dir) / "_ckpt"
+        self.scenes_root = self.root / "scenes"
         self.done_path = self.root / "done.json"
         self.rows_path = self.root / "rows.jsonl"
         self.dropped_path = self.root / "dropped.jsonl"
@@ -60,38 +61,86 @@ class SceneCheckpoint:
         self._done: set[int] | None = None
 
     def exists(self) -> bool:
-        return self.done_path.exists()
+        return self.done_path.exists() or (self.scenes_root.exists() and any(self.scenes_root.glob("*.json")))
 
     def load(self) -> tuple[set[int], list[dict], list[dict], list[dict]]:
         if not self.exists():
             self._done = set()
             return set(), [], [], []
-        done = {int(v) for v in json.loads(self.done_path.read_text(encoding="utf-8")).get("scene_ids", [])}
-        rows = _read_jsonl(self.rows_path)
-        dropped = _read_jsonl(self.dropped_path)
-        extra = _read_jsonl(self.extra_path)
+        # 兼容旧版 append-only 检查点。新检查点按场景单独原子写入，重跑同一
+        # 场景不会重复追加，进程在落盘中途退出也只会留下可忽略的 .tmp。
+        legacy_done = (
+            {int(v) for v in json.loads(self.done_path.read_text(encoding="utf-8")).get("scene_ids", [])}
+            if self.done_path.exists()
+            else set()
+        )
+        scene_payloads = []
+        file_done = set()
+        if self.scenes_root.exists():
+            for path in sorted(self.scenes_root.glob("*.json")):
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                scene_id = int(payload.get("scene_id", int(path.stem)))
+                file_done.add(scene_id)
+                scene_payloads.append(payload)
+
+        legacy_rows = _read_jsonl(self.rows_path)
+        legacy_dropped = _read_jsonl(self.dropped_path)
+        legacy_extra = _read_jsonl(self.extra_path)
+        if legacy_extra and len(legacy_extra) != len(legacy_rows):
+            raise ValueError("checkpoint extra/rows length mismatch; rerun with --fresh")
+        if file_done:
+            keep = [int(row.get("scene_id", -1)) not in file_done for row in legacy_rows]
+            legacy_rows = [row for row, wanted in zip(legacy_rows, keep) if wanted]
+            if legacy_extra:
+                legacy_extra = [item for item, wanted in zip(legacy_extra, keep) if wanted]
+            legacy_dropped = [row for row in legacy_dropped if int(row.get("scene_id", -1)) not in file_done]
+
+        done = legacy_done | file_done
+        rows = legacy_rows
+        dropped = legacy_dropped
+        extra = legacy_extra
+        for payload in scene_payloads:
+            rows.extend(payload.get("rows") or [])
+            dropped.extend(payload.get("dropped") or [])
+            extra.extend(payload.get("extra") or [])
         self._done = set(done)
         return done, rows, dropped, extra
 
     def save_scene(self, scene_id: int, rows: list[dict], dropped: list[dict], extra: list[dict] | None = None) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.scenes_root.mkdir(parents=True, exist_ok=True)
         if self._done is None:
             if self.done_path.exists():
                 self._done = {int(v) for v in json.loads(self.done_path.read_text(encoding="utf-8")).get("scene_ids", [])}
             else:
                 self._done = set()
-        self._done.add(int(scene_id))
-        _append_jsonl(self.rows_path, rows)
-        _append_jsonl(self.dropped_path, dropped)
-        if extra:
-            _append_jsonl(self.extra_path, extra)
-        self.done_path.write_text(json.dumps({"scene_ids": sorted(self._done)}, ensure_ascii=False) + "\n", encoding="utf-8")
+        scene_id = int(scene_id)
+        payload = {"scene_id": scene_id, "rows": rows, "dropped": dropped, "extra": extra or []}
+        scene_path = self.scenes_root / f"{scene_id:012d}.json"
+        scene_tmp = self.scenes_root / f".{scene_id:012d}.json.tmp"
+        scene_tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n",
+            encoding="utf-8",
+        )
+        scene_tmp.replace(scene_path)
+        self._done.add(scene_id)
+        done_tmp = self.root / ".done.json.tmp"
+        done_tmp.write_text(
+            json.dumps({"scene_ids": sorted(self._done)}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        done_tmp.replace(self.done_path)
 
     def clear(self) -> None:
         self._done = None
         if self.root.exists():
+            if self.scenes_root.exists():
+                for path in self.scenes_root.glob("*"):
+                    if path.is_file():
+                        path.unlink()
+                self.scenes_root.rmdir()
             for path in self.root.glob("*"):
-                path.unlink()
+                if path.is_file():
+                    path.unlink()
             self.root.rmdir()
 
 
@@ -99,10 +148,11 @@ def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            rows.append(json.loads(line))
+    with path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
     return rows
 
 

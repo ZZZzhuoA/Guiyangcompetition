@@ -2,7 +2,8 @@
 
 换真实样本时 --input 指到 kemu6_data_72mb（叶子目录 _1/_2/_3 各是一个样本）：
   python scripts/build_seq_set.py --input kemu6_data_72mb --output outputs/finals_seq --delta 15
-中断后再跑同一条会跳过已完成 scene。推倒重来加 --fresh。
+中断后再跑同一条会续接 `_ckpt/catalog.json` 和 `_ckpt/scenes/*.json`。
+推倒重来加 --fresh；完整成功后 `_ckpt` 会被最终训练文件替代并自动清理。
 """
 
 from __future__ import annotations

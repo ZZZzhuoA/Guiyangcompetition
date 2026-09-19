@@ -80,18 +80,20 @@ def missing_sample_hint(input_dir: Path) -> str:
     return " ".join(lines)
 
 
-def load_run(directory: Path, official: "OfficialRates | None" = None) -> dict:
-    rhdl = read_family_dir(directory, "Stu_ZZGLRHDL")
-    health = read_family_dir(directory, "HealthState")
-    lj = read_family_dir(directory, "Stu_ZZGLLJ")
-    sjzs = read_family_dir(directory, "Stu_SJZS")
-    if not rhdl:
-        raise ValueError(f"Missing Stu_ZZGLRHDL_*.csv in {directory}")
+def load_run_identity(directory: Path, official: "OfficialRates | None" = None) -> dict:
+    """只读取分组所需的轻量信息，不加载三张大表。"""
+    directory = Path(directory)
     meta_path = directory / "meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
     official_rate = None if official is None else official.lookup_rate(directory)
     official_strategy = None if official is None else official.lookup_strategy(directory)
-    sjzs_strategy = parse_strategy_label(sjzs[0].get("S_LJCL")) if sjzs else None
+    sjzs_strategy = None
+    if official_strategy is None:
+        sjzs = read_family_dir(directory, "Stu_SJZS")
+        for row in sjzs:
+            sjzs_strategy = parse_strategy_label(row.get("S_LJCL"))
+            if sjzs_strategy is not None:
+                break
     if official_strategy is not None:
         strategy = official_strategy
         strategy_source = "official_csv"
@@ -111,6 +113,28 @@ def load_run(directory: Path, official: "OfficialRates | None" = None) -> dict:
             )
         strategy = inferred
         strategy_source = "folder"
+    return {
+        "directory": directory,
+        "scene_id": int(meta.get("scene_id", _scene_id_from_name(directory))),
+        "strategy": int(strategy),
+        "strategy_source": strategy_source,
+        "official_intercept_rate": None if official_rate is None else float(official_rate),
+        "replicate_id": _replicate_from_name(directory),
+        "meta": meta,
+    }
+
+
+def load_run(directory: Path, official: "OfficialRates | None" = None) -> dict:
+    identity = load_run_identity(directory, official=official)
+    directory = Path(directory)
+    rhdl = read_family_dir(directory, "Stu_ZZGLRHDL")
+    health = read_family_dir(directory, "HealthState")
+    lj = read_family_dir(directory, "Stu_ZZGLLJ")
+    if not rhdl:
+        raise ValueError(f"Missing or unreadable Stu_ZZGLRHDL CSV in {directory}")
+    meta = identity["meta"]
+    strategy = int(identity["strategy"])
+    strategy_source = str(identity["strategy_source"])
     times = sorted({t for t in (as_float(row.get("FZTime")) for row in rhdl) if t is not None})
     if not times:
         raise ValueError(f"No FZTime values in {directory}")
@@ -147,8 +171,8 @@ def load_run(directory: Path, official: "OfficialRates | None" = None) -> dict:
             continue
         seen.add(key)
         cost += as_float(row.get("D_Costgy"), 0.0)
-    scene_id = int(meta.get("scene_id", _scene_id_from_name(directory)))
-    rate = official_rate
+    scene_id = int(identity["scene_id"])
+    rate = identity["official_intercept_rate"]
     payload = {
         "directory": directory,
         "scene_id": scene_id,
@@ -559,6 +583,188 @@ def _merge_replicate(base: dict, extra: dict) -> None:
         n = max(1, int(base["n_blue"]))
         base["intercepted"] = int(round(base["official_intercept_rate"] * n))
         base["label_source"] = "official_csv"
+
+
+def load_run_catalog(
+    input_dir: Path,
+    results_csv: Path | None = None,
+    checkpoint_path: Path | None = None,
+    resume: bool = True,
+) -> tuple[dict[int, dict[int, list[dict]]], "OfficialRates", dict]:
+    """轻量编目全部 run；不把 RHDL/Health/LJ 表留在内存中。
+
+    返回 `scene_id -> strategy -> identity[]`。建集器随后一次只加载一个
+    scene，避免 `load_grouped_runs` 把上千局的完整轨迹同时保存在内存里。
+    """
+    input_dir = Path(input_dir)
+    found = find_results_csv(input_dir, results_csv)
+    official = load_official_rates(found)
+    catalog: dict[int, dict[int, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    load_errors = []
+    run_dirs = discover_run_dirs(input_dir)
+    n_dirs = len(run_dirs)
+    checkpoint_path = None if checkpoint_path is None else Path(checkpoint_path)
+    fingerprint_text = "\n".join(str(path.resolve()) for path in run_dirs)
+    if found is not None:
+        stat = found.stat()
+        fingerprint_text += f"\nRESULTS={found.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+    fingerprint = hashlib.sha256(fingerprint_text.encode("utf-8")).hexdigest()
+    processed = 0
+    if resume and checkpoint_path is not None and checkpoint_path.exists():
+        try:
+            cached = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if cached.get("version") == 1 and cached.get("fingerprint") == fingerprint:
+                processed = min(n_dirs, max(0, int(cached.get("processed", 0))))
+                load_errors = list(cached.get("load_errors") or [])
+                for raw in cached.get("identities") or []:
+                    identity = dict(raw)
+                    identity["directory"] = Path(identity["directory"])
+                    catalog[int(identity["scene_id"])][int(identity["strategy"])].append(identity)
+                if processed:
+                    print(f"resume catalog: skip {processed} indexed run folder(s)", flush=True)
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            processed = 0
+            load_errors = []
+            catalog.clear()
+
+    def save_catalog_progress(count: int) -> None:
+        if checkpoint_path is None:
+            return
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        identities = []
+        for by_strategy in catalog.values():
+            for entries in by_strategy.values():
+                for item in entries:
+                    identities.append(
+                        {key: value for key, value in item.items() if key != "meta"}
+                    )
+        payload = {
+            "version": 1,
+            "fingerprint": fingerprint,
+            "processed": int(count),
+            "total": n_dirs,
+            "identities": identities,
+            "load_errors": load_errors,
+        }
+        temp_path = checkpoint_path.with_name(f".{checkpoint_path.name}.tmp")
+        temp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+        temp_path.replace(checkpoint_path)
+
+    if n_dirs >= 20 and processed:
+        from src.finals.progress import render_progress
+        render_progress(processed, n_dirs, "catalog runs (lightweight)")
+    for i, directory in enumerate(run_dirs[processed:], start=processed + 1):
+        if n_dirs >= 20 and (i == 1 or i % 50 == 0 or i == n_dirs):
+            from src.finals.progress import render_progress
+            render_progress(i, n_dirs, "catalog runs (lightweight)")
+        has_rhdl = bool(list(directory.glob("Stu_ZZGLRHDL_*.csv"))) or (directory / "Stu_ZZGLRHDL.csv").exists()
+        if not has_rhdl:
+            load_errors.append({"directory": str(directory), "error": "missing Stu_ZZGLRHDL CSV"})
+            if i % 50 == 0 or i == n_dirs:
+                save_catalog_progress(i)
+            continue
+        try:
+            identity = load_run_identity(directory, official=official)
+        except (TypeError, ValueError, KeyError, IndexError, AttributeError, OSError) as exc:
+            load_errors.append({"directory": str(directory), "error": str(exc)})
+            if i % 50 == 0 or i == n_dirs:
+                save_catalog_progress(i)
+            continue
+        identity.pop("meta", None)
+        catalog[int(identity["scene_id"])][int(identity["strategy"])].append(identity)
+        if i % 50 == 0 or i == n_dirs:
+            save_catalog_progress(i)
+
+    identities = [
+        item
+        for by_strategy in catalog.values()
+        for entries in by_strategy.values()
+        for item in entries
+    ]
+    n_triple = sum(1 for by_strategy in catalog.values() if len(by_strategy) >= 3)
+    n_pair = sum(1 for by_strategy in catalog.values() if len(by_strategy) >= 2)
+    n_with_reps = sum(
+        1 for by_strategy in catalog.values() for entries in by_strategy.values() if len(entries) >= 3
+    )
+    meta = {
+        "results_csv": None if found is None else str(found),
+        "n_official_rate_rows": official.n_rows,
+        "n_official_matched": sum(item.get("official_intercept_rate") is not None for item in identities),
+        "n_official_strategy_matched": sum(item.get("strategy_source") == "official_csv" for item in identities),
+        "n_runs": len(identities),
+        "n_scene_strategy_pairs": sum(len(by_strategy) for by_strategy in catalog.values()),
+        "n_scenes": len(catalog),
+        "n_scenes_with_3_strategies": n_triple,
+        "n_scenes_with_2plus_strategies": n_pair,
+        "n_scenes_with_3_replicates": n_with_reps,
+        "index_gaps": inventory_index_gaps(run_dirs),
+        "n_load_errors": len(load_errors),
+        "load_errors": load_errors[:40],
+        "conflicts": [],
+        "official_columns": official.columns,
+    }
+    return catalog, official, meta
+
+
+def load_catalog_scene(
+    by_strategy_entries: dict[int, list[dict]],
+    official: "OfficialRates",
+) -> tuple[dict[int, dict], list[dict]]:
+    """加载一个场景；同策略重复只保留第一份可读轨迹。"""
+    by_strategy: dict[int, dict] = {}
+    errors: list[dict] = []
+    for strategy, entries in sorted(by_strategy_entries.items()):
+        base = None
+        base_directory = None
+        for entry in entries:
+            directory = Path(entry["directory"])
+            try:
+                base = load_run(directory, official=official)
+                base_directory = str(directory)
+                break
+            except (TypeError, ValueError, KeyError, IndexError, AttributeError, OSError) as exc:
+                errors.append({"directory": str(directory), "error": str(exc)})
+        if base is None:
+            continue
+        # 当前合并语义本来就只保留第一份轨迹，其余重复只贡献官方拦截率。
+        # 因此无需再把其余重复的三张大表读入内存。
+        for entry in entries:
+            if str(entry["directory"]) == base_directory:
+                continue
+            _merge_replicate(
+                base,
+                {
+                    "directory": Path(entry["directory"]),
+                    "official_intercept_rate": entry.get("official_intercept_rate"),
+                },
+            )
+        by_strategy[int(strategy)] = base
+    return by_strategy, errors
+
+
+def inventory_catalog(catalog: dict[int, dict[int, list[dict]]]) -> list[dict]:
+    """不加载大表也能写入 summary 的 run 清单。"""
+    rows = []
+    for scene_id, by_strategy in sorted(catalog.items()):
+        for strategy, entries in sorted(by_strategy.items()):
+            rates = [float(e["official_intercept_rate"]) for e in entries if e.get("official_intercept_rate") is not None]
+            first = entries[0]
+            rows.append(
+                {
+                    "scene_id": int(scene_id),
+                    "strategy": int(strategy),
+                    "strategy_source": first.get("strategy_source"),
+                    "directory": str(first["directory"]),
+                    "n_replicates": len(entries),
+                    "replicates": [str(e["directory"]) for e in entries],
+                    "label_source": "official_csv" if rates else "health",
+                    "official_intercept_rate": None if not rates else float(sum(rates) / len(rates)),
+                }
+            )
+    return rows
 
 
 def load_grouped_runs(input_dir: Path, results_csv: Path | None = None) -> tuple[dict[int, dict[int, dict]], dict]:

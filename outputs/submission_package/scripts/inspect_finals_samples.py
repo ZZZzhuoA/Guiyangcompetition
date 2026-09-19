@@ -19,7 +19,7 @@ from src.finals.dataset import (
     _scene_id_from_name,
     _strategy_from_name,
     discover_run_dirs,
-    load_grouped_runs,
+    load_run_catalog,
     missing_sample_hint,
 )
 
@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=12, help="runs 预览条数")
     args = parser.parse_args()
     dirs = discover_run_dirs(args.input)
-    _, ingest = load_grouped_runs(args.input, results_csv=args.results) if dirs else ({}, {})
+    _, _, ingest = load_run_catalog(args.input, results_csv=args.results) if dirs else ({}, None, {})
     preview = []
     for directory in dirs[: max(0, args.limit)]:
         csvs = sorted(p.name for p in directory.glob("*.csv"))

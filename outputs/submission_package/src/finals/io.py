@@ -8,10 +8,11 @@
 from __future__ import annotations
 
 import csv
-import io
+import codecs
 import math
 import re
 from pathlib import Path
+from typing import TextIO
 
 from src.finals.schema import HEALTH_COLUMNS, LJ_COLUMNS, RHDL_COLUMNS, SJZS_COLUMNS, as_bool, as_float, as_int, is_blank
 
@@ -99,7 +100,9 @@ def detect_csv_encoding(data: bytes) -> str:
             except UnicodeDecodeError:
                 continue
     try:
-        data.decode("utf-8")
+        # final=False permits a sampled buffer to end in the middle of a
+        # multi-byte UTF-8 character.
+        codecs.getincrementaldecoder("utf-8")().decode(data, final=False)
         return "utf-8"
     except UnicodeDecodeError:
         pass
@@ -112,20 +115,50 @@ def detect_csv_encoding(data: bytes) -> str:
     return "gb18030"
 
 
+def detect_csv_file_encoding(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """流式探测文件编码，内存恒定。
+
+    过去 `_csv_stream` 会 `read_bytes()` 再构造一份完整 Unicode 字符串，单个大
+    CSV 会同时存在 bytes、str 和解析后的行，峰值内存很高。这里最多保留一个
+    chunk，并完整扫描 UTF-8 合法性；非 UTF-8 赛方表回退为 GB18030。
+    """
+    path = Path(path)
+    with path.open("rb") as stream:
+        head = stream.read(4)
+        if head.startswith(b"\xef\xbb\xbf"):
+            return "utf-8-sig"
+        if head.startswith(b"\xff\xfe"):
+            return "utf-16"
+        if head.startswith(b"\xfe\xff"):
+            return "utf-16-be"
+        if not head:
+            return "utf-8"
+        if b"\x00" in head:
+            return "utf-16"
+        stream.seek(0)
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        try:
+            while True:
+                chunk = stream.read(chunk_size)
+                if not chunk:
+                    break
+                decoder.decode(chunk, final=False)
+            decoder.decode(b"", final=True)
+            return "utf-8"
+        except UnicodeDecodeError:
+            return "gb18030"
+
+
 def decode_csv_text(path: Path) -> str:
-    """探测编码后再 decode。GBK/GB18030 的赛方表不会再按 UTF-8 打开。"""
-    data = Path(path).read_bytes()
-    if not data:
-        return ""
-    encoding = detect_csv_encoding(data)
-    try:
-        return data.decode(encoding)
-    except UnicodeDecodeError:
-        return data.decode("gb18030", errors="replace")
+    """兼容旧调用方；大表读取应使用 `_csv_stream`。"""
+    encoding = detect_csv_file_encoding(path)
+    return Path(path).read_text(encoding=encoding, errors="replace")
 
 
-def _csv_stream(path: Path) -> io.StringIO:
-    return io.StringIO(decode_csv_text(path), newline="")
+def _csv_stream(path: Path) -> TextIO:
+    """返回磁盘流，不再把整个 CSV 复制到内存。调用方必须关闭。"""
+    encoding = detect_csv_file_encoding(path)
+    return Path(path).open("r", encoding=encoding, errors="replace", newline="")
 
 
 def _sniff_dialect(sample: str) -> csv.Dialect:
@@ -166,19 +199,19 @@ def _looks_like_data_row(raw: dict, header_to_schema: dict[str, str], types: dic
 
 def read_csv_table(path: Path) -> tuple[list[str], list[dict]]:
     """宽松读：编码探测、分隔符探测。给结果表用，不按 schema 抽列。"""
-    stream = _csv_stream(path)
-    sample = stream.read(8192)
-    stream.seek(0)
-    reader = csv.DictReader(stream, dialect=_sniff_dialect(sample))
-    headers = [_header_key(name) for name in (reader.fieldnames or [])]
-    if reader.fieldnames:
-        reader.fieldnames = headers
     rows = []
-    for raw in reader:
-        row = {_header_key(key): (None if value is None else str(value).strip()) for key, value in raw.items()}
-        if not any(value for value in row.values() if not is_blank(value)):
-            continue
-        rows.append(row)
+    with _csv_stream(path) as stream:
+        sample = stream.read(8192)
+        stream.seek(0)
+        reader = csv.DictReader(stream, dialect=_sniff_dialect(sample))
+        headers = [_header_key(name) for name in (reader.fieldnames or [])]
+        if reader.fieldnames:
+            reader.fieldnames = headers
+        for raw in reader:
+            row = {_header_key(key): (None if value is None else str(value).strip()) for key, value in raw.items()}
+            if not any(value for value in row.values() if not is_blank(value)):
+                continue
+            rows.append(row)
     return headers, rows
 
 
@@ -201,53 +234,53 @@ def read_csv(path: Path, columns: list[tuple[str, str]], allow_missing: bool = T
     names = [name for name, _ in columns]
     types = {name: primitive for name, primitive in columns}
     wanted = set(names)
-    stream = _csv_stream(path)
-    sample = stream.read(8192)
-    stream.seek(0)
-    reader = csv.DictReader(stream, dialect=_sniff_dialect(sample))
-    raw_headers = list(reader.fieldnames or [])
-    if not raw_headers:
-        raise ValueError(f"Missing headers: {path}")
-    normalized = [_header_key(h) for h in raw_headers]
-    reader.fieldnames = normalized
-    header_to_schema: dict[str, str] = {}
-    for original, key in zip(raw_headers, normalized):
-        if key in wanted and key not in header_to_schema.values() and original not in header_to_schema:
-            header_to_schema[key] = key
-    present = set(header_to_schema.values())
-    for schema_name, aliases in _COLUMN_ALIASES.items():
-        if schema_name not in wanted or schema_name in present:
-            continue
-        for key in normalized:
-            if key in aliases:
-                header_to_schema[key] = schema_name
-                present.add(schema_name)
-                break
-    if not allow_missing:
-        missing = [name for name in names if name not in present]
-        if missing:
-            raise ValueError(f"Required columns missing in {path}: {missing}")
     records = []
-    skipped = 0
-    seen_data = False
-    for raw in reader:
-        if not seen_data:
-            if skipped < _MAX_LEADING_SKIP and not _looks_like_data_row(raw, header_to_schema, types):
-                skipped += 1
+    with _csv_stream(path) as stream:
+        sample = stream.read(8192)
+        stream.seek(0)
+        reader = csv.DictReader(stream, dialect=_sniff_dialect(sample))
+        raw_headers = list(reader.fieldnames or [])
+        if not raw_headers:
+            raise ValueError(f"Missing headers: {path}")
+        normalized = [_header_key(h) for h in raw_headers]
+        reader.fieldnames = normalized
+        header_to_schema: dict[str, str] = {}
+        for original, key in zip(raw_headers, normalized):
+            if key in wanted and key not in header_to_schema.values() and original not in header_to_schema:
+                header_to_schema[key] = key
+        present = set(header_to_schema.values())
+        for schema_name, aliases in _COLUMN_ALIASES.items():
+            if schema_name not in wanted or schema_name in present:
                 continue
-            seen_data = True
-        elif not _looks_like_data_row(raw, header_to_schema, types):
-            continue
-        row = {name: None for name in names}
-        for header, schema_name in header_to_schema.items():
-            value = raw.get(header)
-            try:
-                row[schema_name] = _parse_value(value, types[schema_name])
-            except (TypeError, ValueError):
-                row[schema_name] = None
-        if not any(value is not None for value in row.values()):
-            continue
-        records.append(row)
+            for key in normalized:
+                if key in aliases:
+                    header_to_schema[key] = schema_name
+                    present.add(schema_name)
+                    break
+        if not allow_missing:
+            missing = [name for name in names if name not in present]
+            if missing:
+                raise ValueError(f"Required columns missing in {path}: {missing}")
+        skipped = 0
+        seen_data = False
+        for raw in reader:
+            if not seen_data:
+                if skipped < _MAX_LEADING_SKIP and not _looks_like_data_row(raw, header_to_schema, types):
+                    skipped += 1
+                    continue
+                seen_data = True
+            elif not _looks_like_data_row(raw, header_to_schema, types):
+                continue
+            row = {name: None for name in names}
+            for header, schema_name in header_to_schema.items():
+                value = raw.get(header)
+                try:
+                    row[schema_name] = _parse_value(value, types[schema_name])
+                except (TypeError, ValueError):
+                    row[schema_name] = None
+            if not any(value is not None for value in row.values()):
+                continue
+            records.append(row)
     return records
 
 

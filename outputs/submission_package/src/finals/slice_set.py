@@ -9,7 +9,15 @@ from pathlib import Path
 import numpy as np
 
 from src.finals.context import DecisionContext
-from src.finals.dataset import candidate_times, inventory_runs, load_grouped_runs, missing_sample_hint, outcome_from_run, _sample_row
+from src.finals.dataset import (
+    _sample_row,
+    candidate_times,
+    inventory_catalog,
+    load_catalog_scene,
+    load_run_catalog,
+    missing_sample_hint,
+    outcome_from_run,
+)
 from src.finals.features import FEATURE_NAMES, dict_to_vector, extract_feature_dict, utility_from_outcome
 from src.finals.progress import ProgressBar, SceneCheckpoint
 from src.finals.schema import STRATEGIES
@@ -129,30 +137,50 @@ def build_slice_set(
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    grouped, ingest = load_grouped_runs(input_dir, results_csv=results_csv)
-    if not grouped:
-        raise ValueError(missing_sample_hint(input_dir))
     ckpt = SceneCheckpoint(output_dir)
+    if not resume:
+        ckpt.clear()
+    catalog, official, ingest = load_run_catalog(
+        input_dir,
+        results_csv=results_csv,
+        checkpoint_path=ckpt.root / "catalog.json",
+        resume=resume,
+    )
+    if not catalog:
+        raise ValueError(missing_sample_hint(input_dir))
     if resume:
         done, rows, dropped, _ = ckpt.load()
     else:
-        ckpt.clear()
         done, rows, dropped = set(), [], []
+    print(
+        f"slice catalog: {ingest.get('n_runs', 0)} run(s), {len(catalog)} scene(s); "
+        f"checkpoint: {ckpt.root}",
+        flush=True,
+    )
     if done:
         print(f"resume slice: skip {len(done)} finished scene(s)", flush=True)
-    scenes = [(scene_id, by_strategy) for scene_id, by_strategy in sorted(grouped.items()) if scene_id not in done]
+    scenes = [(scene_id, entries) for scene_id, entries in sorted(catalog.items()) if scene_id not in done]
     bar = ProgressBar(len(scenes), prefix="slice")
-    for scene_id, by_strategy in scenes:
+    for scene_id, entries in scenes:
+        by_strategy, scene_load_errors = load_catalog_scene(entries, official)
+        if scene_load_errors:
+            ingest["n_load_errors"] = int(ingest.get("n_load_errors", 0)) + len(scene_load_errors)
+            ingest.setdefault("load_errors", []).extend(scene_load_errors)
         try:
-            scene_rows, scene_dropped = _process_scene(
-                scene_id, by_strategy, n_ticks, max_mid_slices, with_forks, time_stride_s
-            )
-        except _SCENE_FAIL as exc:
+            if not by_strategy:
+                raise ValueError("no readable run in scene")
+            scene_rows, scene_dropped = _process_scene(scene_id, by_strategy, n_ticks, max_mid_slices, with_forks, time_stride_s)
+        except _SCENE_ERRORS as exc:
             scene_rows, scene_dropped = [], [{"scene_id": scene_id, "time": None, "kind": "scene", "reason": f"skip:{exc}"}]
+        for item in scene_load_errors:
+            scene_dropped.append(
+                {"scene_id": scene_id, "time": None, "kind": "load", "reason": f"skip:{item['error']}"}
+            )
         rows.extend(scene_rows)
         dropped.extend(scene_dropped)
         ckpt.save_scene(scene_id, scene_rows, scene_dropped)
         bar.update(extra=f"scene {scene_id}")
+        del by_strategy
     bar.close()
     if not rows:
         raise ValueError("No slice samples kept")
@@ -174,9 +202,9 @@ def build_slice_set(
     summary = {
         "mode": "single_slice_scoring",
         "n_rows": len(rows),
-        "n_scenes": len(grouped),
-        "n_runs": ingest.get("n_runs", sum(len(by_strategy) for by_strategy in grouped.values())),
-        "n_scene_strategy_pairs": ingest.get("n_scene_strategy_pairs", len(grouped)),
+        "n_scenes": len(catalog),
+        "n_runs": ingest.get("n_runs", sum(len(entries) for by_strategy in catalog.values() for entries in by_strategy.values())),
+        "n_scene_strategy_pairs": ingest.get("n_scene_strategy_pairs", len(catalog)),
         "n_scenes_with_3_strategies": ingest.get("n_scenes_with_3_strategies", 0),
         "n_scenes_with_3_replicates": ingest.get("n_scenes_with_3_replicates", 0),
         "n_official_matched": ingest.get("n_official_matched", 0),
@@ -185,7 +213,7 @@ def build_slice_set(
         "n_dropped": len(dropped),
         "time_stride_s": time_stride_s,
         "n_load_errors": ingest.get("n_load_errors", 0),
-        "runs": inventory_runs(grouped),
+        "runs": inventory_catalog(catalog),
         "drop_reasons": {r: sum(1 for d in dropped if d["reason"] == r) for r in sorted({d["reason"] for d in dropped})},
         "kind_counts": {kind: sum(1 for row in rows if row["kind"] == kind) for kind in sorted({row["kind"] for row in rows})},
         "strategy_counts": {str(s): sum(1 for row in rows if row["strategy"] == s) for s in STRATEGIES},

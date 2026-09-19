@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import argparse
-import pickle
 import sys
 import time
 from pathlib import Path
@@ -30,9 +29,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=3)
     args = parser.parse_args()
 
-    with args.model.open("rb") as stream:
-        scorer = pickle.load(stream)
-    policy = FinalsPolicy(scorer=scorer)
+    policy = FinalsPolicy.load(args.model)
+    scorer = policy.scorer
     print(f"model={args.model.name} needs_history={getattr(scorer, 'needs_history', False)}")
 
     rng = np.random.default_rng(args.seed)

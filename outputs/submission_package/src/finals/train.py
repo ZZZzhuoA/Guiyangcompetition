@@ -161,10 +161,17 @@ def fit_scorer(scorer, data: dict, mask: np.ndarray, weights: np.ndarray):
 
 
 def scene_split(scene_id: np.ndarray, test_ratio: float = 0.25, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    if not 0.0 < float(test_ratio) < 1.0:
+        raise ValueError(f"test_ratio must be between 0 and 1 (exclusive), got {test_ratio}")
     rng = np.random.default_rng(seed)
     scenes = np.unique(scene_id)
+    if len(scenes) < 2:
+        raise ValueError(
+            f"Need at least 2 distinct scenes for a train/test split, got {len(scenes)}. "
+            "Add another scene before training."
+        )
     rng.shuffle(scenes)
-    n_test = max(1, int(round(len(scenes) * test_ratio)))
+    n_test = min(len(scenes) - 1, max(1, int(round(len(scenes) * test_ratio))))
     test_scenes = set(scenes[:n_test].tolist())
     test = np.array([int(s) in test_scenes for s in scene_id], dtype=bool)
     return ~test, test
