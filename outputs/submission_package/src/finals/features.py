@@ -339,8 +339,9 @@ def utility_from_outcome(intercepted: int, leaked: int, cost: float, n_blue: int
     intercept_rate = intercepted / n_blue
     leak_rate = leaked / n_blue
     cost_eff = intercept_rate / (0.35 + cost)
-    close_pen = mean_intercept_time / 30.0
-    utility = 1.15 * intercept_rate + 0.25 * cost_eff - 0.65 * leak_rate - 0.04 * close_pen
+    # 赛方主指标是拦截率。保留漏防率、成本和费效比作为诊断列，但不再把
+    # 它们揉进训练目标，否则可能把拦截率更高的策略标成负样本。
+    utility = intercept_rate
     return {
         "intercept_rate": intercept_rate,
         "leak_rate": leak_rate,

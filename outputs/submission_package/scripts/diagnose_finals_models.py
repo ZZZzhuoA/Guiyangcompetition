@@ -81,8 +81,13 @@ def diagnose_row(row: dict) -> list[tuple[str, str]]:
         if gap > THRESHOLDS["overfit_gap"]:
             out.append((WARN, f"train/test match 差 {gap:.2f}，过拟合，考虑降容量或砍特征维度"))
     groups = row.get("test_groups")
-    if groups is not None and groups < THRESHOLDS["min_groups"]:
+    tied_groups = int(row.get("test_tied_groups") or 0)
+    if groups == 0:
+        out.append((BLOCKER, "测试集没有收益有差异的策略对照组，无法评价模型"))
+    elif groups is not None and groups < THRESHOLDS["min_groups"]:
         out.append((WARN, f"测试对照组只有 {groups} 个，match 没有统计意义"))
+    if groups and tied_groups > int(groups):
+        out.append((WARN, f"测试集中并列组 {tied_groups} 个，多于有效组 {groups} 个，标签区分度偏低"))
     lift = row.get("lift_vs_best_fixed")
     if lift is not None and lift <= 0.0:
         out.append((BLOCKER, f"整局拦截率相对最好的固定策略 lift={lift:+.4f}，打不过锁死一个策略"))
@@ -96,6 +101,8 @@ def diagnose_row(row: dict) -> list[tuple[str, str]]:
 def diagnose_global(rows: list[dict]) -> list[tuple[str, str]]:
     """跨模型的判定：指标本身有没有分辨力。"""
     findings = []
+    if rows and all(int(r.get("test_groups") or 0) == 0 for r in rows):
+        findings.append((BLOCKER, "测试集所有策略对照均为并列，没有可用于选模的有效组"))
     rates = [r["episode_intercept_rate"] for r in rows if r.get("episode_intercept_rate") is not None]
     if len(rates) >= 2 and max(rates) - min(rates) < 1e-9:
         findings.append(
@@ -154,6 +161,20 @@ def main() -> None:
     for level, msg in diagnose_dataset(args.dataset):
         print(f"  [{level:5s}] {msg}")
 
+    target = summary.get("target_diagnostics") or {}
+    if target:
+        print()
+        print("=" * 96)
+        print("训练目标")
+        print("=" * 96)
+        for split_name in ("train", "test"):
+            item = target.get(split_name) or {}
+            print(
+                f"  {split_name:5s}: key={item.get('key')}  "
+                f"strategy_mean={item.get('strategy_mean')}  winner_hist={item.get('winner_hist')}  "
+                f"有效组={item.get('informative_groups')}  并列组={item.get('tied_groups')}"
+            )
+
     print()
     print("=" * 96)
     print("指标分辨力")
@@ -166,7 +187,7 @@ def main() -> None:
     print("逐模型指标")
     print("=" * 96)
     header = (
-        f"{'name':16s} {'trn_m':>6s} {'tst_m':>6s} {'grp':>4s} {'collap':>6s} "
+        f"{'name':16s} {'trn_m':>6s} {'tst_m':>6s} {'grp':>4s} {'tie':>4s} {'collap':>6s} "
         f"{'margin':>10s} {'lat_ms':>7s} {'ep_rate':>8s} {'lift':>8s} {'score':>6s}"
     )
     print(header)
@@ -174,7 +195,8 @@ def main() -> None:
     for row in rows:
         print(
             f"{row['name']:16s} {_fmt(row.get('train_match'), '.3f'):>6s} {_fmt(row.get('test_match'), '.3f'):>6s} "
-            f"{_fmt(row.get('test_groups'), 'd'):>4s} {_fmt(row.get('test_collapse'), '.3f'):>6s} "
+            f"{_fmt(row.get('test_groups'), 'd'):>4s} {_fmt(row.get('test_tied_groups'), 'd'):>4s} "
+            f"{_fmt(row.get('test_collapse'), '.3f'):>6s} "
             f"{_fmt(row.get('test_score_margin'), '.2e'):>10s} {_fmt(row.get('latency_ms'), '.2f'):>7s} "
             f"{_fmt(row.get('episode_intercept_rate'), '.4f'):>8s} {_fmt(row.get('lift_vs_best_fixed'), '+.4f'):>8s} "
             f"{_fmt(row.get('selection_score'), '.3f'):>6s}"

@@ -48,13 +48,20 @@ def group_match(
         groups.setdefault(str(gid), []).append(i)
     correct = 0
     total = 0
+    tied = 0
     pred_hist = {s: 0 for s in STRATEGIES}
     oracle_hist = {s: 0 for s in STRATEGIES}
     margin = []
     for idxs in groups.values():
         if len({int(strategy[i]) for i in idxs}) < 2:
             continue
-        best = int(strategy[idxs[int(np.argmax([utility[i] for i in idxs]))]])
+        values = np.asarray([utility[i] for i in idxs], dtype=float)
+        # np.argmax 会把完全并列的第一行固定判成策略 1。这样的组没有提供
+        # 策略优劣信息，不应计入 match 或 oracle_hist。
+        if float(np.max(values) - np.min(values)) <= 1e-12:
+            tied += 1
+            continue
+        best = int(strategy[idxs[int(np.argmax(values))]])
         rec, scores = scorer.recommend(x[idxs[0]].reshape(1, -1), **_history_slice(history, idxs[0]))
         pred = int(rec[0])
         pred_hist[pred] += 1
@@ -66,6 +73,7 @@ def group_match(
         margin.append(float(ordered[-1] - ordered[-2]) if len(ordered) >= 2 else 0.0)
     return {
         "n_groups": total,
+        "n_tied_groups": tied,
         "match": None if total == 0 else correct / total,
         "pred_hist": pred_hist,
         "oracle_hist": oracle_hist,

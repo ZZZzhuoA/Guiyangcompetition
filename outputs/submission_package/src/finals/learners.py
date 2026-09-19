@@ -194,7 +194,12 @@ class SoftmaxPolicy:
         xs, ys, ws = [], [], []
         weight = np.ones(len(utility)) if sample_weight is None else np.asarray(sample_weight, dtype=float)
         for idxs in grouped.values():
-            best = idxs[int(np.argmax([utility[i] for i in idxs]))]
+            values = np.asarray([utility[i] for i in idxs], dtype=float)
+            # 并列组没有分类标签；argmax 会无条件把第一行（通常是策略 1）
+            # 当作正确答案，导致分类器人为塌缩到策略 1。
+            if float(np.max(values) - np.min(values)) <= 1e-12:
+                continue
+            best = idxs[int(np.argmax(values))]
             xs.append(x[idxs[0]])
             ys.append(int(strategy[best]) - 1)
             ws.append(float(np.mean(weight[idxs])))

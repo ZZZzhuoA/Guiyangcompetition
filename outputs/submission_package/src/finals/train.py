@@ -32,6 +32,13 @@ OPTIONAL_LABEL_KEYS = (
     "done",
 )
 
+OUTCOME_KEYS = (
+    "intercept_rate",
+    "leak_rate",
+    "cost",
+    "cost_eff",
+)
+
 
 def _cell(row: dict, name: str) -> float:
     value = row.get(name, 0.0)
@@ -76,6 +83,9 @@ def save_training_npz(output_dir: Path, rows: list[dict], extra: dict | None = N
         "group_id": np.array([row["group_id"] for row in rows]),
         "feature_names": np.array(FEATURE_NAMES),
     }
+    for key in OUTCOME_KEYS:
+        if rows and key in rows[0]:
+            payload[key] = np.array([_cell(row, key) for row in rows], dtype=float)
     for key in OPTIONAL_LABEL_KEYS:
         if rows and key in rows[0]:
             payload[key] = np.array([_cell(row, key) for row in rows], dtype=float)
@@ -109,6 +119,9 @@ def load_arrays(dataset_dir: Path) -> dict:
         "group_id": packed["group_id"],
         "feature_names": np.array(FEATURE_NAMES),
     }
+    for key in OUTCOME_KEYS:
+        if key in packed.files:
+            data[key] = packed[key]
     for key in OPTIONAL_LABEL_KEYS:
         if key in packed.files:
             data[key] = packed[key]
@@ -119,14 +132,37 @@ def load_arrays(dataset_dir: Path) -> dict:
     for key in ("a_prev", "hist_len"):
         if key in packed.files:
             data[key] = packed[key]
+    # 旧版 NPZ 没有保存 outcome 列。直接从已经生成的 CSV 补齐，避免为了
+    # 改训练目标重新跑数小时的原始数据构造。
+    missing_outcomes = [key for key in OUTCOME_KEYS if key not in data]
+    if missing_outcomes and csv_path.exists():
+        values = {key: [] for key in missing_outcomes}
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            available = set(reader.fieldnames or [])
+            wanted = [key for key in missing_outcomes if key in available]
+            for row in reader:
+                for key in wanted:
+                    values[key].append(_cell(row, key))
+        for key, column in values.items():
+            if len(column) == len(data["strategy"]):
+                data[key] = np.asarray(column, dtype=float)
     return data
 
 
 def _label(scorer, data: dict, mask: np.ndarray) -> np.ndarray:
-    key = getattr(scorer, "label_key", "utility")
+    key = label_key(scorer, data)
     if key in data:
         return data[key][mask]
     return data["utility"][mask]
+
+
+def label_key(scorer, data: dict) -> str:
+    """序列模型沿用各自标签；单切片模型统一对齐整局拦截率。"""
+    explicit = getattr(scorer, "label_key", None)
+    if explicit:
+        return str(explicit)
+    return "intercept_rate" if "intercept_rate" in data else "utility"
 
 
 def history_kwargs(scorer, data: dict, mask: np.ndarray) -> dict:
@@ -141,6 +177,13 @@ def history_kwargs(scorer, data: dict, mask: np.ndarray) -> dict:
 
 
 def fit_scorer(scorer, data: dict, mask: np.ndarray, weights: np.ndarray):
+    # 单切片模型只从确有策略差异的组学习动作偏好。大量三策略同为 0 的
+    # 短分叉样本会稀释信号；若整批都并列则保留原 mask，让后续诊断明确
+    # 报出“无有效组”，而不是在训练阶段以空数组崩溃。
+    if getattr(scorer, "label_key", None) is None and "intercept_rate" in data:
+        informative = informative_group_mask(data, mask, data["intercept_rate"])
+        if np.any(informative):
+            mask = informative
     kwargs = history_kwargs(scorer, data, mask)
     if getattr(scorer, "needs_transition", False) and "x_next" in data:
         reward_key = getattr(scorer, "reward_key", "r_shaped")
@@ -158,6 +201,20 @@ def fit_scorer(scorer, data: dict, mask: np.ndarray, weights: np.ndarray):
         **kwargs,
     )
     return scorer
+
+
+def informative_group_mask(data: dict, mask: np.ndarray, target: np.ndarray) -> np.ndarray:
+    keep = np.zeros(len(mask), dtype=bool)
+    groups: dict[str, list[int]] = {}
+    for i in np.flatnonzero(mask):
+        groups.setdefault(str(data["group_id"][i]), []).append(int(i))
+    for idxs in groups.values():
+        if len({int(data["strategy"][i]) for i in idxs}) < 2:
+            continue
+        values = np.asarray([target[i] for i in idxs], dtype=float)
+        if float(np.max(values) - np.min(values)) > 1e-12:
+            keep[idxs] = True
+    return keep
 
 
 def scene_split(scene_id: np.ndarray, test_ratio: float = 0.25, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -217,7 +274,9 @@ def train_policy(dataset_dir: Path, output_dir: Path, test_ratio: float = 0.25, 
         "n_features": int(data["x"].shape[1]),
         "n_train": int(train_mask.sum()),
         "n_test": int(test_mask.sum()),
+        "label_key": label_key(scorer, data),
         "split": split,
+        "train_groups": train_metrics,
         "test_groups": metrics,
         "strategies": list(STRATEGIES),
     }
@@ -256,13 +315,15 @@ def compare_models(
             {
                 "name": name,
                 "family": MODEL_CATALOG[name]["family"],
-                "label_key": getattr(scorer, "label_key", "utility"),
+                "label_key": label_key(scorer, data),
                 "reward_key": getattr(scorer, "reward_key", None),
                 "oracle_key": test_m.get("oracle_key"),
                 "train_match": train_m["match"],
                 "test_match": test_m["match"],
                 "train_groups": train_m["n_groups"],
                 "test_groups": test_m["n_groups"],
+                "train_tied_groups": train_m.get("n_tied_groups", 0),
+                "test_tied_groups": test_m.get("n_tied_groups", 0),
                 "test_collapse": test_m.get("collapse"),
                 # 三策略打分的最大差，接近 0 说明模型没有区分能力，输出等价于固定策略
                 "test_score_margin": test_m.get("mean_score_margin"),
@@ -301,6 +362,10 @@ def compare_models(
         "default_submit": DEFAULT_SUBMIT,
         "chosen": chosen,
         "split": split,
+        "target_diagnostics": {
+            "train": target_diagnostics(data, cf & train_mask),
+            "test": target_diagnostics(data, cf & test_mask),
+        },
         "note": "chosen 只是当前指标排序，不会覆盖 policy.pkl。赛方 CSV 上的测试是 split.json 里那些测试场景的 group_match；--with-replay 用的是本地玩具世界，不是赛方样本。",
         "rows": rows,
         "replay": None if replay is None else {k: v for k, v in replay.items() if k != "decisions"},
@@ -338,12 +403,46 @@ def oracle_label(data: dict) -> tuple[np.ndarray, str]:
     """对照组的“正确答案”按赛方主指标定：有整局拦截率就用它，别用各模型自己的标签。"""
     if "r_term" in data:
         return data["r_term"], "r_term"
+    if "intercept_rate" in data:
+        return data["intercept_rate"], "intercept_rate"
     return data["utility"], "utility"
+
+
+def target_diagnostics(data: dict, mask: np.ndarray) -> dict:
+    """汇总实际选模标签，明确均值、有效组和并列组。"""
+    target, key = oracle_label(data)
+    means = {}
+    for strategy in STRATEGIES:
+        selected = mask & (data["strategy"].astype(int) == int(strategy))
+        means[int(strategy)] = None if not np.any(selected) else float(np.mean(target[selected]))
+    groups: dict[str, list[int]] = {}
+    for i in np.flatnonzero(mask):
+        groups.setdefault(str(data["group_id"][i]), []).append(int(i))
+    winners = {int(strategy): 0 for strategy in STRATEGIES}
+    tied = 0
+    informative = 0
+    for idxs in groups.values():
+        if len({int(data["strategy"][i]) for i in idxs}) < 2:
+            continue
+        values = np.asarray([target[i] for i in idxs], dtype=float)
+        if float(np.max(values) - np.min(values)) <= 1e-12:
+            tied += 1
+            continue
+        best = int(data["strategy"][idxs[int(np.argmax(values))]])
+        winners[best] += 1
+        informative += 1
+    return {
+        "key": key,
+        "strategy_mean": means,
+        "winner_hist": winners,
+        "informative_groups": informative,
+        "tied_groups": tied,
+    }
 
 
 def evaluate_groups(scorer, data: dict, mask: np.ndarray) -> dict:
     if not np.any(mask):
-        return {"n_groups": 0, "match": None, "pred_hist": {s: 0 for s in STRATEGIES}, "oracle_hist": {s: 0 for s in STRATEGIES}, "collapse": 1.0, "random_baseline": 1.0 / len(STRATEGIES)}
+        return {"n_groups": 0, "n_tied_groups": 0, "match": None, "pred_hist": {s: 0 for s in STRATEGIES}, "oracle_hist": {s: 0 for s in STRATEGIES}, "collapse": 1.0, "random_baseline": 1.0 / len(STRATEGIES)}
     oracle, key = oracle_label(data)
     out = group_match(
         scorer,
